@@ -3,7 +3,7 @@
 # WeasyPrint needs system libraries (Pango, Cairo, GObject, etc.) that aren't
 # present in a default Python image, so we install them explicitly here.
 
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 # System libraries required by WeasyPrint + general image build
 RUN apt-get update && apt-get install -y --no-install-recommends \
