@@ -34,4 +34,4 @@ COPY . .
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8080
 
-CMD gunicorn app:app --bind 0.0.0.0:${PORT:-8080} --timeout 300 --workers 2
+CMD ["sh", "-c", "gunicorn app:app --bind 0.0.0.0:${PORT:-8080} --timeout 300 --workers 2"]
