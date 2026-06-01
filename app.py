@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 
 from services.firebase_auth import init_firebase, require_auth
-from services.pdf_builder   import build_pdf_from_csv
+from services.genodyn_report import build_pdf          # condensed, topic-organized report
 from services.email_sender  import send_report_email
 
 # ── Setup ──────────────────────────────────────────────────────────────
@@ -25,6 +25,8 @@ BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR  = os.path.join(BASE_DIR, "uploads")
 OUTPUT_DIR  = os.path.join(BASE_DIR, "outputs")
 SCRIPT      = os.path.join(BASE_DIR, "generate_variant_report.py")
+TRAIT_CSV   = os.path.join(BASE_DIR, "data", "trait_df.csv")        # GWAS effect alleles + odds ratios
+EQ_CSV      = os.path.join(BASE_DIR, "data", "equilibrium_df.csv")  # LD r^2 for dedup
 ALLOWED_EXT = {".txt"}
 MAX_MB      = 50
 
@@ -135,9 +137,15 @@ def upload(user):
         if not os.path.exists(snpedia_csv):
             return jsonify({"error": "Annotated CSV was not generated"}), 500
 
-        # Build PDF
+        # Build PDF (condensed, topic-organized; enriched with GWAS traits + LD dedup)
         log.info(f"[{job_id}] building PDF")
-        pdf_bytes = build_pdf_from_csv(snpedia_csv, user_display_name=display_name)
+        pdf_bytes = build_pdf(
+            snpedia_csv,
+            trait_csv=TRAIT_CSV,
+            eq_csv=EQ_CSV,
+            user_display_name=display_name,
+            drop_neutral_zero=True,
+        )
         pdf_path = os.path.join(job_dir, "genodynlabs_report.pdf")
         with open(pdf_path, "wb") as f:
             f.write(pdf_bytes)
