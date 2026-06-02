@@ -173,7 +173,7 @@ def _highlight(effect_allele, genotype, repute):
 # ----------------------------------------------------------- assemble rows
 
 def _load_rows(snpedia_csv, trait_idx, min_magnitude, drop_neutral_zero,
-               require_note, full_topics):
+               require_note):
     rows = []
     with open(snpedia_csv, newline="", encoding="utf-8", errors="replace") as f:
         for r in csv.DictReader(f):
@@ -213,12 +213,7 @@ def _load_rows(snpedia_csv, trait_idx, min_magnitude, drop_neutral_zero,
             # flagged genotype. This is what drops the "Good"/blank filler rows
             # that drop_neutral_zero misses (repute Good but no note), taking
             # the report from ~250 pages down to ~90.
-            #
-            # Topics in full_topics are exempt: every variant in them is kept
-            # even with no note (e.g. show the complete vitamin/mineral panel
-            # regardless of annotation).
-            if (require_note and topic not in full_topics
-                    and not (note or trait or effect or hl)):
+            if require_note and not (note or trait or effect or hl):
                 continue
 
             is_neutral_zero = (mag == 0.0 and repute.lower() == "neutral" and not trait)
