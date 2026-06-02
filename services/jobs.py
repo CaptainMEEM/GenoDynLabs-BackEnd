@@ -26,8 +26,9 @@ except ImportError:                      # standalone / testing
     except ImportError:
         send_report_email = None
 
-BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR  = os.path.join(BASE_DIR, "data")
+BASE_DIR  = os.path.dirname(os.path.abspath(__file__))   # .../services
+ROOT_DIR  = os.path.dirname(BASE_DIR)                     # repo root
+DATA_DIR  = os.path.join(ROOT_DIR, "data")               # root-level data/ (sibling of services/)
 REF_PKL   = os.path.join(DATA_DIR, "reference.pkl")
 TRAIT_CSV = os.path.join(DATA_DIR, "trait_df.csv")
 EQ_CSV    = os.path.join(DATA_DIR, "equilibrium_df.csv")
