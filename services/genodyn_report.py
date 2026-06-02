@@ -185,8 +185,12 @@ def _load_rows(snpedia_csv, trait_idx, min_magnitude, drop_neutral_zero,
             gene = (r.get("gene") or "").strip()
             geno = _norm_geno(r.get("geno"))
             summary = _clean(r.get("summary"))
-            # SNPedia array-QC notes carry no biological meaning -> drop them
-            if re.match(r"(?i)^(common (in|on)\b|normal$|common/normal$|common$)", summary):
+            # Drop SNPedia array-QC boilerplate that carries no biological
+            # meaning -- but ONLY when the whole note is boilerplate. A real
+            # note that merely starts with "Common variant associated with..."
+            # must be kept, so we anchor on the full string ($), not the start.
+            if re.match(r"(?i)^(common( in| on)?|normal|common/normal|"
+                        r"common in clinvar)\s*\.?$", summary):
                 summary = ""
 
             tinfo = trait_idx.get(rsid, {})
@@ -402,7 +406,12 @@ def build_pdf(snpedia_csv, trait_csv, eq_csv, user_display_name="",
                                        reverse=True)[:max_rows_per_article]
         keep, extras = {}, []
         for article, arows in articles.items():
-            if arows[0]["article_kind"] == "trait" or len(arows) >= 3:
+            # Keep an article on its own if it's a named trait, has 3+ rows, OR
+            # contains at least one row with a note. Only genuinely thin AND
+            # note-less gene articles get folded into "Additional", so a gene
+            # with real annotations never disappears into the catch-all bucket.
+            has_noted = any((r.get("note") or "").strip() for r in arows)
+            if arows[0]["article_kind"] == "trait" or len(arows) >= 3 or has_noted:
                 keep[article] = arows
             else:
                 extras.extend(arows)
