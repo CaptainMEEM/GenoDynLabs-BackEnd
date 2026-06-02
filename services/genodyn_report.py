@@ -18,7 +18,7 @@ We do NOT reproduce any third party's curated notes or article groupings.
 Public entry point:
     build_pdf(snpedia_csv, trait_csv, eq_csv, user_display_name="",
               min_magnitude=0.0, max_rows_per_article=14,
-              drop_neutral_zero=False) -> bytes
+              drop_neutral_zero=False, require_note=True) -> bytes
 """
 import re
 import csv
@@ -165,7 +165,8 @@ def _highlight(effect_allele, genotype, repute):
 
 # ----------------------------------------------------------- assemble rows
 
-def _load_rows(snpedia_csv, trait_idx, min_magnitude, drop_neutral_zero):
+def _load_rows(snpedia_csv, trait_idx, min_magnitude, drop_neutral_zero,
+               require_note):
     rows = []
     with open(snpedia_csv, newline="", encoding="utf-8", errors="replace") as f:
         for r in csv.DictReader(f):
@@ -194,6 +195,16 @@ def _load_rows(snpedia_csv, trait_idx, min_magnitude, drop_neutral_zero):
             if not note:
                 note = _clean(r.get("geno_description")) or _clean(r.get("description"))
 
+            hl = _highlight(effect, geno, repute)
+
+            # Quality filter: a row earns its place only if it actually says
+            # something — it has a note, a named trait, an effect allele, or a
+            # flagged genotype. This is what drops the "Good"/blank filler rows
+            # that drop_neutral_zero misses (repute Good but no note), taking
+            # the report from ~250 pages down to ~90.
+            if require_note and not (note or trait or effect or hl):
+                continue
+
             topic = topics.classify(gene=gene, trait=trait)
             article = (trait.title() if trait else (gene or "Other variants"))
             article_kind = "trait" if trait else "gene"
@@ -208,7 +219,7 @@ def _load_rows(snpedia_csv, trait_idx, min_magnitude, drop_neutral_zero):
                 "rsid": rsid, "gene": gene or "\u2014", "effect": effect,
                 "geno": geno, "note": note, "mag": mag, "repute": repute,
                 "topic": topic, "article": article, "article_kind": article_kind,
-                "hl": _highlight(effect, geno, repute),
+                "hl": hl,
             })
     return rows
 
@@ -361,11 +372,12 @@ def _render_html(grouped, totals, user_display_name):
 
 def build_pdf(snpedia_csv, trait_csv, eq_csv, user_display_name="",
               min_magnitude=0.0, max_rows_per_article=14,
-              drop_neutral_zero=False, ld_threshold=0.8):
+              drop_neutral_zero=False, ld_threshold=0.8, require_note=True):
     trait_idx = _build_trait_index(trait_csv)
     ld = _build_ld_index(eq_csv, threshold=ld_threshold)
 
-    rows = _load_rows(snpedia_csv, trait_idx, min_magnitude, drop_neutral_zero)
+    rows = _load_rows(snpedia_csv, trait_idx, min_magnitude, drop_neutral_zero,
+                      require_note)
 
     # group: topic -> article -> [rows]
     grouped = defaultdict(lambda: defaultdict(list))
