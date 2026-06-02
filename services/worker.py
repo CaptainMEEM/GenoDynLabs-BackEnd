@@ -4,7 +4,8 @@ import os, redis
 from rq import Worker, Queue, Connection
 from services.annotate import load_reference   # warm the cache once
 
-load_reference(os.path.join(os.path.dirname(__file__), "services", "data", "reference.pkl"))
+# worker.py lives at the repo root; the data folder is a sibling of services/.
+load_reference(os.path.join(os.path.dirname(__file__), "data", "reference.pkl"))
 
 if __name__ == "__main__":
     conn = redis.from_url(os.environ["REDIS_URL"])
