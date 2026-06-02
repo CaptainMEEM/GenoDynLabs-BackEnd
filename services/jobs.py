@@ -26,9 +26,24 @@ except ImportError:                      # standalone / testing
     except ImportError:
         send_report_email = None
 
-BASE_DIR  = os.path.dirname(os.path.abspath(__file__))   # .../services
-ROOT_DIR  = os.path.dirname(BASE_DIR)                     # repo root
-DATA_DIR  = os.path.join(ROOT_DIR, "data")               # root-level data/ (sibling of services/)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))    # .../services
+
+
+def _find_data_dir():
+    """Locate the folder holding reference.pkl. Tries root-level data/ (this
+    repo's layout) first, then services/data/, so it works regardless of where
+    the data lands. Falls back to root data/ if the pkl isn't found anywhere."""
+    candidates = [
+        os.path.join(os.path.dirname(BASE_DIR), "data"),  # <repo root>/data   (your layout)
+        os.path.join(BASE_DIR, "data"),                   # services/data
+    ]
+    for d in candidates:
+        if os.path.exists(os.path.join(d, "reference.pkl")):
+            return d
+    return candidates[0]
+
+
+DATA_DIR  = _find_data_dir()
 REF_PKL   = os.path.join(DATA_DIR, "reference.pkl")
 TRAIT_CSV = os.path.join(DATA_DIR, "trait_df.csv")
 EQ_CSV    = os.path.join(DATA_DIR, "equilibrium_df.csv")
