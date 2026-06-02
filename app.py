@@ -1,14 +1,14 @@
 import os
-import sys
-import subprocess
 import uuid
 import logging
-from flask import Flask, request, jsonify, send_file
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from services.firebase_auth import init_firebase, require_auth
-from services.genodyn_report import build_pdf          # condensed, topic-organized report
-from services.email_sender  import send_report_email
+from services.jobs import run_report_job
 
 # ── Setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -21,18 +21,9 @@ app = Flask(__name__)
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",")]
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=False)
 
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_DIR  = os.path.join(BASE_DIR, "uploads")
-OUTPUT_DIR  = os.path.join(BASE_DIR, "outputs")
-SCRIPT      = os.path.join(BASE_DIR, "generate_variant_report.py")
-TRAIT_CSV   = os.path.join(BASE_DIR, "data", "trait_df.csv")        # GWAS effect alleles + odds ratios
-EQ_CSV      = os.path.join(BASE_DIR, "data", "equilibrium_df.csv")  # LD r^2 for dedup
 ALLOWED_EXT = {".txt"}
 MAX_MB      = 50
-
 app.config["MAX_CONTENT_LENGTH"] = MAX_MB * 1024 * 1024
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Initialize Firebase on startup so misconfiguration fails fast.
 try:
@@ -41,51 +32,116 @@ try:
 except Exception as e:
     log.warning(f"Firebase init deferred (will retry on first request): {e}")
 
+# ── Job dispatch: RQ if Redis is configured, else a local thread pool ────
+# The caller (/upload) uses the same dispatch() either way; only the executor
+# differs. Add the Redis plugin + set REDIS_URL and this upgrades to the real
+# worker (worker.py) with no further code change. Until then jobs run in a
+# background thread so /upload still returns immediately.
+REDIS_URL   = os.environ.get("REDIS_URL")
+QUEUE_NAME  = "reports"     # must match worker.py
+JOB_TIMEOUT = 600           # seconds; annotate is fast, PDF + email dominate
+RESULT_TTL  = 3600          # keep finished/failed records this long for polling
 
-def allowed(filename):
-    return os.path.splitext(filename)[1].lower() in ALLOWED_EXT
+if REDIS_URL:
+    import redis
+    from rq import Queue
+    from rq.job import Job
+    from rq.exceptions import NoSuchJobError
+
+    _redis = redis.from_url(REDIS_URL)
+    _queue = Queue(QUEUE_NAME, connection=_redis)
+    log.info("dispatch: RQ via REDIS_URL")
+else:
+    # Fallback for local dev / no-Redis deploys. NOTE: status lives in this
+    # process's memory, so it is reliable only with a single web process
+    # (the dev server, or gunicorn --workers 1). The email is still sent from
+    # whichever process ran the job, so delivery is unaffected by worker count.
+    _executor      = ThreadPoolExecutor(max_workers=2)
+    _jobs_lock     = threading.Lock()
+    _jobs          = {}        # job_id -> {"status","uid","variants","error"}
+    MAX_LOCAL_JOBS = 2000      # bound the in-memory store
+    log.info("dispatch: in-process ThreadPoolExecutor (no REDIS_URL)")
 
 
-def preprocess_23andme(src_path, dst_path):
-    """Strip 23andMe comment lines, normalize header."""
-    with open(src_path, "r", errors="replace") as f:
-        lines = f.readlines()
+def _local_runner(job_id, uid, genome_text, user_email, display_name):
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "processing", "uid": uid}
+    try:
+        n = run_report_job(genome_text, user_email, display_name)
+        with _jobs_lock:
+            _jobs[job_id] = {"status": "done", "uid": uid, "variants": n}
+        log.info(f"[{job_id}] done ({n} variants)")
+    except Exception as e:
+        log.exception(f"[{job_id}] failed")
+        with _jobs_lock:
+            _jobs[job_id] = {"status": "failed", "uid": uid, "error": str(e)}
 
+
+def dispatch(job_id, uid, genome_text, user_email, display_name):
+    if REDIS_URL:
+        _queue.enqueue(
+            run_report_job, genome_text, user_email, display_name,
+            job_id=job_id, job_timeout=JOB_TIMEOUT,
+            result_ttl=RESULT_TTL, failure_ttl=RESULT_TTL,
+            meta={"uid": uid},
+        )
+    else:
+        with _jobs_lock:
+            if len(_jobs) >= MAX_LOCAL_JOBS:                 # prune oldest half
+                for k in list(_jobs)[: len(_jobs) // 2]:
+                    _jobs.pop(k, None)
+            _jobs[job_id] = {"status": "queued", "uid": uid}
+        _executor.submit(_local_runner, job_id, uid, genome_text,
+                         user_email, display_name)
+
+
+# ── 23andMe preprocessing (in memory, no temp files) ─────────────────────
+def preprocess_23andme_text(raw_text):
+    """Strip 23andMe comment lines and normalize the header. Pure string work."""
     out = []
     header_written = False
-    for line in lines:
+    for line in raw_text.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
         if stripped.startswith("#"):
             if "rsid" in stripped and not header_written:
-                out.append("rsid\tchromosome\tposition\tgenotype\n")
+                out.append("rsid\tchromosome\tposition\tgenotype")
                 header_written = True
         else:
-            if not header_written:
-                out.append(line)
-                header_written = True
-            else:
-                out.append(line)
-
-    with open(dst_path, "w") as f:
-        f.writelines(out)
+            out.append(line)
+            header_written = True
+    return ("\n".join(out) + "\n") if out else ""
 
 
-# ── Routes ─────────────────────────────────────────────────────────────
+def allowed(filename):
+    return os.path.splitext(filename)[1].lower() in ALLOWED_EXT
 
+
+# ── Status vocabulary: queued | processing | done | failed | unknown ─────
+# Same words for both backends so the frontend handles one set.
+_RQ_STATUS = {
+    "queued": "queued", "deferred": "queued", "scheduled": "queued",
+    "started": "processing",
+    "finished": "done",
+    "failed": "failed", "stopped": "failed", "canceled": "failed",
+}
+
+
+# ── Routes ───────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "dispatch": "rq" if REDIS_URL else "thread"})
 
 
 @app.route("/upload", methods=["POST"])
 @require_auth
 def upload(user):
     """
-    Verified Firebase user uploads their raw 23andMe .txt file.
-    We run Modern Promethease, build a PDF, and email it to their
-    verified Firebase email.
+    Cheap path only: auth, validate the file, strip 23andMe comments in memory,
+    hand the job off, and return 202 + job_id immediately. Annotation, PDF
+    rendering and email all happen in the worker. The email is the primary
+    delivery; /status is for progress UI.
     """
     uid          = user.get("uid")
     user_email   = user.get("email")
@@ -93,7 +149,6 @@ def upload(user):
 
     if not user_email:
         return jsonify({"error": "Your account has no email on file"}), 400
-
     if "file" not in request.files:
         return jsonify({"error": "No file part in request"}), 400
 
@@ -103,82 +158,62 @@ def upload(user):
     if not allowed(file.filename):
         return jsonify({"error": "Only .txt files are accepted"}), 400
 
-    job_id  = str(uuid.uuid4())
-    job_dir = os.path.join(OUTPUT_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
-    log.info(f"[{job_id}] upload from uid={uid} email={user_email}")
+    raw_text   = file.read().decode("utf-8", errors="replace")
+    clean_text = preprocess_23andme_text(raw_text)
 
-    raw_path   = os.path.join(UPLOAD_DIR, f"{job_id}_raw.txt")
-    clean_path = os.path.join(job_dir, "genome_clean.txt")
-    file.save(raw_path)
+    first_line = clean_text.split("\n", 1)[0].lower()
+    if "rsid" not in first_line:
+        return jsonify({"error": "File does not look like a valid 23andMe file"}), 400
+    if clean_text.count("\n") < 2:                     # header only, no data rows
+        return jsonify({"error": "File contains no genotype rows"}), 400
 
-    try:
-        preprocess_23andme(raw_path, clean_path)
+    job_id = str(uuid.uuid4())
+    log.info(f"[{job_id}] upload from uid={uid} email={user_email}; dispatching")
+    dispatch(job_id, uid, clean_text, user_email, display_name)
 
-        with open(clean_path) as f:
-            header = f.readline().strip().lower()
-        if "rsid" not in header:
-            return jsonify({"error": "File does not look like a valid 23andMe file"}), 400
+    return jsonify({
+        "job_id":     job_id,
+        "status":     "queued",
+        "emailed_to": user_email,
+        "message":    "Your report is being generated and will be emailed to you.",
+    }), 202
 
-        # Run Modern Promethease
-        log.info(f"[{job_id}] running Modern Promethease")
-        result = subprocess.run(
-            [sys.executable, SCRIPT, clean_path],
-            capture_output=True, text=True, cwd=job_dir, timeout=300,
-        )
-        if result.returncode != 0:
-            log.error(f"[{job_id}] promethease failed: {result.stderr[-500:]}")
-            return jsonify({
-                "error": "Promethease processing failed",
-                "details": result.stderr[-2000:],
-            }), 500
 
-        snpedia_csv = os.path.join(job_dir, "snpedia_data.csv")
-        if not os.path.exists(snpedia_csv):
-            return jsonify({"error": "Annotated CSV was not generated"}), 500
+@app.route("/status/<job_id>")
+@require_auth
+def status(user, job_id):
+    """
+    Poll a job. Mirrors upload's auth wiring: `user` is injected by
+    require_auth and `job_id` comes from the URL. Only the job's owner can
+    read it (uid check) so status can't be probed across accounts.
+    """
+    uid = user.get("uid")
 
-        # Build PDF (condensed, topic-organized; enriched with GWAS traits + LD dedup)
-        log.info(f"[{job_id}] building PDF")
-        pdf_bytes = build_pdf(
-            snpedia_csv,
-            trait_csv=TRAIT_CSV,
-            eq_csv=EQ_CSV,
-            user_display_name=display_name,
-            drop_neutral_zero=True,
-        )
-        pdf_path = os.path.join(job_dir, "genodynlabs_report.pdf")
-        with open(pdf_path, "wb") as f:
-            f.write(pdf_bytes)
+    if REDIS_URL:
+        try:
+            job = Job.fetch(job_id, connection=_redis)
+        except NoSuchJobError:
+            return jsonify({"job_id": job_id, "status": "unknown"}), 404
+        if job.meta.get("uid") != uid:
+            return jsonify({"job_id": job_id, "status": "unknown"}), 404
+        state = _RQ_STATUS.get(job.get_status(refresh=True), "unknown")
+        body = {"job_id": job_id, "status": state}
+        if state == "done":
+            body["variants"] = job.result
+        elif state == "failed":
+            body["error"] = "Report generation failed"
+        return jsonify(body)
 
-        # Email it
-        log.info(f"[{job_id}] emailing PDF to {user_email}")
-        send_report_email(
-            to_address=user_email,
-            user_display_name=display_name,
-            pdf_bytes=pdf_bytes,
-            pdf_filename="genodynlabs_report.pdf",
-        )
-
-        # Count variants for the response
-        with open(snpedia_csv) as f:
-            total = sum(1 for _ in f) - 1
-
-        return jsonify({
-            "job_id":         job_id,
-            "total_variants": total,
-            "emailed_to":     user_email,
-            "message":        "Your report has been emailed to you.",
-        })
-
-    except subprocess.TimeoutExpired:
-        log.error(f"[{job_id}] promethease timed out")
-        return jsonify({"error": "Processing timed out"}), 500
-    except Exception as e:
-        log.exception(f"[{job_id}] failed")
-        return jsonify({"error": str(e)}), 500
-    finally:
-        if os.path.exists(raw_path):
-            os.remove(raw_path)
+    with _jobs_lock:
+        info = _jobs.get(job_id)
+    if not info or info.get("uid") != uid:
+        return jsonify({"job_id": job_id, "status": "unknown"}), 404
+    body = {"job_id": job_id, "status": info["status"]}
+    if info["status"] == "done":
+        body["variants"] = info.get("variants")
+    elif info["status"] == "failed":
+        body["error"] = "Report generation failed"
+    return jsonify(body)
 
 
 if __name__ == "__main__":
