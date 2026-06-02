@@ -2,8 +2,16 @@
 The unit of work, isolated from any web framework or queue. Call it from an
 RQ/Celery worker, a thread, or directly. Heavy reference data is loaded once
 per process (inside annotate) and reused across every job.
+
+The job receives the *cleaned genome text*, not a path. On Railway the web and
+worker run as separate services with separate filesystems, so a path written by
+the web dyno is invisible to the worker. The text travels in the job payload
+(through Redis). Each job writes its own scratch dir and removes it when done,
+so nothing accumulates on the worker and retries stay safe.
 """
 import os
+import shutil
+import tempfile
 
 try:
     from . import annotate, genodyn_report
@@ -25,17 +33,29 @@ TRAIT_CSV = os.path.join(DATA_DIR, "trait_df.csv")
 EQ_CSV    = os.path.join(DATA_DIR, "equilibrium_df.csv")
 
 
-def run_report_job(job_dir, clean_path, user_email, display_name=""):
-    """Annotate -> build PDF -> email. Returns variant count. Safe to retry."""
-    snpedia_csv = os.path.join(job_dir, "snpedia_data.csv")
-    n = annotate_genome(clean_path, snpedia_csv, ref_path=REF_PKL)   # ~0.3s
+def run_report_job(genome_text, user_email, display_name=""):
+    """Annotate -> build PDF -> email. Returns variant count. Safe to retry.
 
-    pdf = build_pdf(snpedia_csv, trait_csv=TRAIT_CSV, eq_csv=EQ_CSV,
-                    user_display_name=display_name, require_note=True)
-    with open(os.path.join(job_dir, "genodynlabs_report.pdf"), "wb") as f:
-        f.write(pdf)
+    `genome_text` is the comment-stripped, header-normalized 23andMe file as a
+    single string (the web service already did that cheap part). We materialize
+    it in a private scratch dir because annotate_genome / build_pdf operate on
+    file paths, then tear the dir down regardless of outcome.
+    """
+    scratch = tempfile.mkdtemp(prefix="genodyn_")
+    try:
+        genome_path = os.path.join(scratch, "genome_clean.txt")
+        with open(genome_path, "w", newline="") as f:
+            f.write(genome_text)
 
-    if send_report_email and user_email:
-        send_report_email(to_address=user_email, user_display_name=display_name,
-                          pdf_bytes=pdf, pdf_filename="genodynlabs_report.pdf")
-    return n
+        snpedia_csv = os.path.join(scratch, "snpedia_data.csv")
+        n = annotate_genome(genome_path, snpedia_csv, ref_path=REF_PKL)   # ~0.3s
+
+        pdf = build_pdf(snpedia_csv, trait_csv=TRAIT_CSV, eq_csv=EQ_CSV,
+                        user_display_name=display_name, require_note=True)
+
+        if send_report_email and user_email:
+            send_report_email(to_address=user_email, user_display_name=display_name,
+                              pdf_bytes=pdf, pdf_filename="genodynlabs_report.pdf")
+        return n
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
