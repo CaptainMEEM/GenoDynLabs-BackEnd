@@ -67,7 +67,7 @@ def run_report_job(genome_text, user_email, display_name=""):
         n = annotate_genome(genome_path, snpedia_csv, ref_path=REF_PKL)   # ~0.3s
 
         pdf = build_pdf(snpedia_csv, trait_csv=TRAIT_CSV, eq_csv=EQ_CSV,
-                        user_display_name=display_name, require_note=True)
+                        user_display_name=display_name, require_note=False)
 
         if send_report_email and user_email:
             send_report_email(to_address=user_email, user_display_name=display_name,
