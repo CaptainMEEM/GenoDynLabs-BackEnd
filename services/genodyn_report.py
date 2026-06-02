@@ -382,8 +382,12 @@ def _render_html(grouped, totals, user_display_name):
 # --------------------------------------------------------------- entry point
 
 def build_pdf(snpedia_csv, trait_csv, eq_csv, user_display_name="",
-              min_magnitude=0.0, max_rows_per_article=14,
-              drop_neutral_zero=False, ld_threshold=0.8, require_note=True):
+              min_magnitude=0.001, max_rows_per_article=14,
+              drop_neutral_zero=False, ld_threshold=0.8, require_note=False):
+    # Old-report behavior: show variants with SNPedia magnitude > 0 (plus any
+    # row carrying a named GWAS trait, which is exempt from the floor below).
+    # require_note defaults off so the filter is purely magnitude-based, which
+    # is what the original Modern Promethease report displayed by default.
     trait_idx = _build_trait_index(trait_csv)
     ld = _build_ld_index(eq_csv, threshold=ld_threshold)
 
