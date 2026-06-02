@@ -130,11 +130,18 @@ def _build_ld_index(eq_csv, threshold=0.8):
 
 
 def _dedup_article(rows, ld):
-    """Within one article keep the highest-magnitude SNP of each LD cluster."""
+    """Within one article keep the highest-magnitude SNP of each LD cluster.
+
+    A row that carries a note is never collapsed away — LD-dedup only removes
+    redundant rows that have nothing to say. This keeps the dedup from hiding
+    informative variants (e.g. two MTHFD1 SNPs with distinct GWAS notes) just
+    because they happen to be in linkage disequilibrium.
+    """
     rows = sorted(rows, key=lambda r: r["mag"], reverse=True)
     kept, kept_ids = [], set()
     for r in rows:
-        if any(o in kept_ids for o in ld.get(r["rsid"], ())):
+        has_note = bool((r.get("note") or "").strip())
+        if not has_note and any(o in kept_ids for o in ld.get(r["rsid"], ())):
             continue
         kept.append(r)
         kept_ids.add(r["rsid"])
@@ -166,7 +173,7 @@ def _highlight(effect_allele, genotype, repute):
 # ----------------------------------------------------------- assemble rows
 
 def _load_rows(snpedia_csv, trait_idx, min_magnitude, drop_neutral_zero,
-               require_note):
+               require_note, full_topics):
     rows = []
     with open(snpedia_csv, newline="", encoding="utf-8", errors="replace") as f:
         for r in csv.DictReader(f):
@@ -197,17 +204,22 @@ def _load_rows(snpedia_csv, trait_idx, min_magnitude, drop_neutral_zero,
 
             hl = _highlight(effect, geno, repute)
 
+            topic = topics.classify(gene=gene, trait=trait)
+            article = (trait.title() if trait else (gene or "Other variants"))
+            article_kind = "trait" if trait else "gene"
+
             # Quality filter: a row earns its place only if it actually says
             # something — it has a note, a named trait, an effect allele, or a
             # flagged genotype. This is what drops the "Good"/blank filler rows
             # that drop_neutral_zero misses (repute Good but no note), taking
             # the report from ~250 pages down to ~90.
-            if require_note and not (note or trait or effect or hl):
+            #
+            # Topics in full_topics are exempt: every variant in them is kept
+            # even with no note (e.g. show the complete vitamin/mineral panel
+            # regardless of annotation).
+            if (require_note and topic not in full_topics
+                    and not (note or trait or effect or hl)):
                 continue
-
-            topic = topics.classify(gene=gene, trait=trait)
-            article = (trait.title() if trait else (gene or "Other variants"))
-            article_kind = "trait" if trait else "gene"
 
             is_neutral_zero = (mag == 0.0 and repute.lower() == "neutral" and not trait)
             if drop_neutral_zero and is_neutral_zero:
@@ -388,6 +400,9 @@ def build_pdf(snpedia_csv, trait_csv, eq_csv, user_display_name="",
     for topic_key, articles in list(grouped.items()):
         for article, arows in list(articles.items()):
             deduped = _dedup_article(arows, ld)
+            # Hard cap: keep the highest-magnitude rows up to the limit. Rows
+            # past the cap are dropped even if they have notes, by design, to
+            # keep long articles readable.
             articles[article] = sorted(deduped, key=lambda x: x["mag"],
                                        reverse=True)[:max_rows_per_article]
         keep, extras = {}, []
