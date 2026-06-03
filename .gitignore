@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+data/snp_df.csv
+data/geno_df.csv
+data/trait_df.csv
+data/equilibrium_df.csv
