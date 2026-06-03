@@ -1,0 +1,5 @@
+# Build-time ONLY. Needed solely to (re)generate data/reference.pkl from the
+# SNPedia/GWAS CSVs via `python -m services.precompute_reference ...`.
+# Not installed in the runtime image.
+pandas>=2.0.0
+numpy>=1.24.0

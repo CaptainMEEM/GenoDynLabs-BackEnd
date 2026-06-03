@@ -1,0 +1,12 @@
+# Runtime dependencies (web + worker). Deliberately pandas/numpy-free: the
+# request path never parses a CSV, so the image stays small and memory low.
+flask>=3.0.0
+flask-cors>=4.0.0
+gunicorn>=21.0.0
+firebase-admin>=6.5.0
+msal>=1.28.0
+requests>=2.31.0
+weasyprint>=60.0
+redis>=5.0.0
+rq>=1.16.0
+cryptography>=42.0.0
