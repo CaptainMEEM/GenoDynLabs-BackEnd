@@ -17,14 +17,17 @@ layout without reusing its content).
 # (topic key, display label, banner background, banner text color)
 TOPICS = [
     ("nutrients",   "Nutrients \u2013 Vitamins, Minerals & Diet", "#e6efd8", "#5c6b3f"),
+    ("methylation", "Methylation & Homocysteine",                 "#dcefe4", "#2f6b4a"),
+    ("diet",        "Diet, Food & Intolerances",                  "#f3e8d2", "#7a5c1e"),
     ("heart",       "Heart & Vascular Health",                    "#fff3d6", "#7a5c1e"),
     ("metabolic",   "Metabolic Health",                           "#d9e8f5", "#2f5169"),
     ("brain",       "Brain, Mood & Sleep",                        "#fbe0ea", "#7a3350"),
-    ("immune",      "Immune & Autoimmune",                        "#e6e0f2", "#4a3d6b"),
+    ("immune",      "Immune, Allergy & Autoimmune",               "#e6e0f2", "#4a3d6b"),
     ("cancer",      "Cancer Risk",                                "#f6ddd6", "#7a3a28"),
     ("detox",       "Detoxification & Drug Metabolism",           "#d6ece8", "#235049"),
     ("hormones",    "Hormones & Fertility",                       "#efe7d6", "#6b5320"),
     ("musculo",     "Bone, Joint & Muscle",                       "#e0eaf2", "#33536b"),
+    ("conditions",  "Inherited Conditions",                       "#f0e2e2", "#6b3a3a"),
     ("traits",      "Traits & Pharmacogenomics",                  "#f2ead6", "#6b5a20"),
     ("longevity",   "Longevity & Aging",                          "#ece0f2", "#523d6b"),
     ("other",       "Other Findings",                             "#ededed", "#444444"),
@@ -126,6 +129,14 @@ _add("detox", "TPMT", "DPYD")
 _add("brain", "BHLHE41")
 _add("immune", "IL23R")
 _add("longevity", "FOXO3", "KLOTHO")
+
+# Route every nutrient-panel gene to the Nutrients topic so vitamins/minerals
+# always land in the Vitamins & Minerals section.
+try:
+    from . import gene_labels as _gl
+except ImportError:
+    import gene_labels as _gl
+_add("nutrients", *_gl.NUTRIENT_OF_GENE.keys())
 
 
 def classify_trait(trait):
