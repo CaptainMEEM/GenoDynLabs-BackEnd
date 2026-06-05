@@ -22,8 +22,14 @@ from weasyprint import HTML, CSS
 
 try:
     from . import topics
+    from . import gene_labels
+    from . import features
+    from . import curated
 except ImportError:
     import topics
+    import gene_labels
+    import features
+    import curated
 
 EMDASH = "\u2014"
 
@@ -36,9 +42,24 @@ def _esc(s):
 # ---------------------------------------------------------- article keying
 
 def _article_for(rec):
-    """The article (sub-section) a record belongs to. Curated function labels
-    win (e.g. 'Vitamin B12 Status (FUT2)'); otherwise a named trait; otherwise
-    the gene; otherwise a catch-all."""
+    """The article (sub-section) a record belongs to.
+
+    A user-CURATED variant ID wins first (guaranteed placement); then a curated
+    FEATURE by gene (MTHFR -> 'Folate Conversion (MTHFR)', LCT -> 'Lactose
+    Tolerance'); then a deana nutrient tag; then nutrient genes group under
+    their NUTRIENT; then curated function labels, a named trait, the gene, and
+    finally a catch-all."""
+    cv = curated.CURATED_VARIANTS.get((rec.get("rsid") or "").lower())
+    if cv:
+        return cv[0]                             # user-specified category
+    feat = features.feature_for(rec.get("gene"))
+    if feat:
+        return feat[0]                           # feature article label
+    if rec.get("nutrient"):
+        return rec["nutrient"]
+    nut = gene_labels.nutrient_of(rec.get("gene"))
+    if nut:
+        return nut                               # group by nutrient panel
     if rec.get("label_known"):
         return rec["label"]                      # curated, function-first
     if rec.get("primary_trait"):
@@ -56,6 +77,10 @@ def _interest(rec):
     """Ranking score: flagged + has-OR + magnitude + has-real-note. Drives both
     LD-dedup (keep the most informative of a linked cluster) and the page cap."""
     score = float(rec.get("mag") or 0.0)
+    if rec.get("pathogenic"):
+        score += 5.0
+    if (rec.get("rsid") or "").lower() in curated.CURATED_VARIANTS:
+        score += 2.0
     if rec.get("hl") in ("hl-orange", "hl-bad"):
         score += 3.0
     if rec.get("hl") == "hl-yellow":
@@ -170,17 +195,27 @@ def _render_html(grouped, totals, user_display_name):
         p.append(f'<div class="topic" style="background:{m["bg"]};color:{m["fg"]};">'
                  f'{_esc(m["label"])}</div>')
         articles = grouped[topic_key]
+        _nut_index = {n: i for i, n in enumerate(gene_labels.PANEL_ORDER)}
 
         def _akey(a):
             if a.startswith("Additional variants"):
-                return (1, 0)
-            return (0, -max(_interest(r) for r in articles[a]))
+                return (2, 0, 0)
+            if a in _nut_index:           # nutrients in canonical panel order
+                return (0, _nut_index[a], 0)
+            return (1, 0, -max(_interest(r) for r in articles[a]))
 
         for article in sorted(articles, key=_akey):
             rows = articles[article]
+            real = [r for r in rows if not r.get("_placeholder") and not r.get("_synth")]
+            synth = [r for r in rows if r.get("_synth")]
+            if real:
+                meta = f'{len(real)} variant{"s" if len(real) != 1 else ""}'
+            elif synth:
+                meta = f'{len(synth)} marker{"s" if len(synth) != 1 else ""}'
+            else:
+                meta = "not assessed"
             p.append(f'<h3 class="article">{_esc(article)}'
-                     f' <span class="meta">({len(rows)} variant'
-                     f'{"s" if len(rows) != 1 else ""})</span></h3>')
+                     f' <span class="meta">({meta})</span></h3>')
             p.append('<table class="snp"><thead><tr>'
                      '<th class="c-gene">Gene</th><th class="c-rsid">RS ID</th>'
                      '<th class="c-effect">Effect</th>'
@@ -216,7 +251,7 @@ def _render_html(grouped, totals, user_display_name):
 # --------------------------------------------------------------- entry point
 
 def build_pdf(records, user_display_name="", target_pages=100,
-              max_rows_per_article=18, ld_map=None, rows_per_page=12):
+              max_rows_per_article=14, ld_map=None, rows_per_page=12):
     """Group, de-duplicate, cap, and render the annotated records to PDF bytes.
 
     A GLOBAL row budget (target_pages * rows_per_page) keeps the report near the
@@ -237,15 +272,28 @@ def build_pdf(records, user_display_name="", target_pages=100,
     # group ALL records: topic -> article -> [records]
     grouped_all = defaultdict(lambda: defaultdict(list))
     for r in records:
-        topic = topics.classify(gene=r.get("gene"), trait=r.get("primary_trait"))
+        cv = curated.CURATED_VARIANTS.get((r.get("rsid") or "").lower())
+        feat = features.feature_for(r.get("gene"))
+        if cv:
+            topic = cv[1]                    # user-curated variant -> its topic
+        elif feat:
+            topic = feat[1]                  # feature's topic (diet/methylation/…)
+        elif r.get("nutrient") or gene_labels.nutrient_of(r.get("gene")):
+            topic = "nutrients"              # vitamins/minerals panel always wins
+        else:
+            topic = topics.classify(gene=r.get("gene"), trait=r.get("primary_trait"))
         grouped_all[topic][_article_for(r)].append(r)
 
     # de-dup + cap each article, then collapse the weak single-row tail into a
     # per-topic "Additional" table so the report reads as multi-row sections.
+    NUTRIENT_SET = set(gene_labels.NUTRIENT_ORDER)
+    FEATURE_LABELS = {f[0] for f in features.FEATURES} | set(features.ARCHETYPES)
+    PINNED = NUTRIENT_SET | FEATURE_LABELS
     grouped = defaultdict(dict)
     for topic_key, articles in grouped_all.items():
         capped = {}
         for article, arows in articles.items():
+            cap = max_rows_per_article          # uniform 14-row cap, nutrients included
             kept, kept_ids = [], set()
             for r in sorted(arows, key=_interest, reverse=True):
                 links = ld_map.get(r["rsid"], ())
@@ -255,14 +303,16 @@ def build_pdf(records, user_display_name="", target_pages=100,
                     continue
                 kept.append(r)
                 kept_ids.add(r["rsid"])
-            capped[article] = kept[:max_rows_per_article]
+            capped[article] = kept[:cap]
 
         keep, extras = {}, []
         for article, arows in capped.items():
             standout = any(r.get("hl") == "hl-orange"
                            or (r.get("mag") or 0) >= 2.5 for r in arows)
-            # own header if: 2+ variants, OR a genuinely notable single finding
-            if len(arows) >= 2 or standout:
+            # Nutrient-panel and curated FEATURE articles (Lactose, MTHFR, CoQ10,
+            # …) ALWAYS keep their own header. Otherwise: own header if 2+
+            # variants or a genuinely notable single finding.
+            if article in PINNED or len(arows) >= 2 or standout:
                 keep[article] = arows
             else:
                 extras.extend(arows)
@@ -287,7 +337,18 @@ def build_pdf(records, user_display_name="", target_pages=100,
 
     chosen = defaultdict(dict)
     rows_used = 0
+
+    # Phase 0: PIN the nutrient panel AND curated feature articles (Lactose,
+    # MTHFR, CoQ10, …) — always included and exempt from the budget cutoff.
     for topic_key, article, arows, _score in named:
+        if article in PINNED:
+            chosen[topic_key][article] = arows
+            rows_used += len(arows)
+
+    # Phase 1: select the strongest remaining NAMED articles until budget fills.
+    for topic_key, article, arows, _score in named:
+        if article in PINNED:
+            continue
         if rows_used >= budget:
             break
         chosen[topic_key][article] = arows
@@ -307,11 +368,47 @@ def build_pdf(records, user_display_name="", target_pages=100,
     grouped = chosen
     truncated = total_found - rows_used
 
+    # Guarantee the COMPLETE vitamins/minerals panel: every requested nutrient
+    # appears, even if the user had no variant there (honest empty-state row).
+    nutrients = grouped.setdefault("nutrients", {})
+    for label in gene_labels.PANEL_ORDER:
+        if label not in nutrients:
+            nutrients[label] = [{
+                "gene": EMDASH, "rsid": EMDASH, "effect_allele": "",
+                "geno": EMDASH, "hl": "", "mag": 0.0, "max_or": None,
+                "primary_trait": "", "label_known": True, "_placeholder": True,
+                "note": gene_labels.panel_empty_note(label),
+            }]
+
+    # Matched-only archetypes (Mediterranean diet, Hunter-gatherer vs Farmer):
+    # synthesized from a few well-known marker SNPs the user actually carries.
+    # These reference rows shown elsewhere, so they're tagged _synth and excluded
+    # from the variant totals to avoid double counting.
+    by_rsid = {r["rsid"]: r for r in records if r.get("rsid")}
+    for alabel, info in features.ARCHETYPES.items():
+        rows = []
+        for rsid, desc in info["markers"].items():
+            r = by_rsid.get(rsid)
+            if not r:
+                continue
+            rows.append({
+                "gene": r.get("gene") or EMDASH, "rsid": rsid,
+                "effect_allele": r.get("effect_allele", ""),
+                "geno": r.get("geno", "--"), "hl": r.get("hl", ""),
+                "mag": 0.0, "max_or": None, "primary_trait": "",
+                "label_known": True, "_synth": True,
+                "note": desc + ".",
+            })
+        if rows:                                  # only if the user matched ≥1 marker
+            grouped.setdefault(info["topic"], {})[alabel] = rows[:max_rows_per_article]
+
     # totals
     flagged = with_trait = final_count = 0
     for articles in grouped.values():
         for arows in articles.values():
             for r in arows:
+                if r.get("_placeholder") or r.get("_synth"):
+                    continue
                 final_count += 1
                 if r.get("hl") in ("hl-orange", "hl-bad"):
                     flagged += 1
