@@ -1,2 +1,5 @@
+# Auto detect text files and perform LF normalization
 * text=auto
+
+# Ship reference.pkl as-is; never let git "normalize" the binary pickle.
 data/reference.pkl binary
