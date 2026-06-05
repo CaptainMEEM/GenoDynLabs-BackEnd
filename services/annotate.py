@@ -72,7 +72,7 @@ def annotate_genome(genome_text, ref_path="data/reference.pkl"):
     records = []
     n_seen = n_matched = 0
     for rsid, raw_geno in _iter_genome(genome_text):
-        rec = snps.get(rsid)
+        rec = snps.get(rsid) or snps.get(rsid.lower())
         if rec is None:
             continue
         n_seen += 1
@@ -99,6 +99,7 @@ def annotate_genome(genome_text, ref_path="data/reference.pkl"):
             "chr": rec.get("chr", ""),
             "pos": rec.get("pos", ""),
             "genes": rec.get("genes", []),
+            "nutrient": rec.get("nutrient"),     # deana-tagged panel routing
         })
         records.append(ann)
         n_matched += 1
