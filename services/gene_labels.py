@@ -185,3 +185,147 @@ def baseline_note(gene):
 
 def is_known(gene):
     return _canon(gene) in GENE_FUNCTION
+
+
+# ====================================================================
+# NUTRIENT PANEL
+# --------------------------------------------------------------------
+# The Vitamins & Minerals section is special: users expect to see a fixed
+# panel of nutrients (not scattered gene articles). So we map established
+# nutrient genes to a NUTRIENT, and the report groups all of a nutrient's
+# genes under one article (e.g. "Vitamin B12" listing FUT2, TCN2, MUT...).
+#
+# Each entry: nutrient label -> (always-true baseline note, [canonical genes]).
+# Genes not present in a given user's file simply don't appear. Genes are
+# assigned to ONE primary nutrient (the most established association) so each
+# lands in a single article; the Gene column preserves the real symbol.
+#
+# Ordered: fat-soluble + C, then B-complex, then macro/trace minerals.
+# Grounded in established nutrigenomics (transporters, cofactor enzymes,
+# absorption receptors). Add genes freely.
+# ====================================================================
+NUTRIENTS = [
+    ("Vitamin A",
+     "Influences how efficiently dietary beta-carotene is converted to active vitamin A and how retinol is carried in blood.",
+     ["BCO1", "BCMO1", "BCO2", "RBP4", "TTR"]),
+    ("Vitamin B1 (Thiamine)",
+     "Affects thiamine transport into cells and its activation to the coenzyme form used in energy metabolism.",
+     ["SLC19A2", "SLC19A3", "TPK1", "SLC25A19"]),
+    ("Vitamin B2 (Riboflavin)",
+     "Affects riboflavin transport and the FAD/FMN cofactors many enzymes (including MTHFR) depend on.",
+     ["SLC52A1", "SLC52A2", "SLC52A3"]),
+    ("Vitamin B3 (Niacin)",
+     "Part of the pathway that makes NAD (the active form of niacin) from tryptophan and dietary niacin.",
+     ["HAAO", "QPRT", "NAPRT", "NNMT", "NMNAT1", "NMNAT2", "NMNAT3", "NADK"]),
+    ("Vitamin B5 (Pantothenic Acid)",
+     "Affects pantothenate handling and coenzyme A synthesis used throughout fat and energy metabolism.",
+     ["PANK1", "PANK2", "PANK3", "PANK4", "SLC5A6"]),
+    ("Vitamin B6",
+     "Affects activation and levels of vitamin B6 (pyridoxal-5'-phosphate), a cofactor for ~150 enzymes.",
+     ["NBPF3", "ALPL", "ALDH7A1", "PNPO"]),
+    ("Vitamin B7 (Biotin)",
+     "Affects recycling and use of biotin; deficiency in these enzymes impairs the body's biotin economy.",
+     ["BTD", "HLCS"]),
+    ("Vitamin B9 (Folate)",
+     "Affects folate transport and the folate pool; the MTHFR/folate-cycle enzymes are shown under Methylation & Folate Cycle.",
+     ["DHFR", "SLC19A1", "FOLR1", "FOLH1", "GGH", "TYMS", "FPGS"]),
+    ("Vitamin B12",
+     "Affects vitamin B12 absorption and transport; the B12-dependent recycling enzymes are shown under Methylation & Folate Cycle.",
+     ["FUT2", "FUT6", "TCN1", "TCN2", "CUBN", "AMN", "GIF", "MMAA", "MMAB", "MUT"]),
+    ("Vitamin C",
+     "Affects how vitamin C (ascorbate) is taken into cells and the plasma vitamin C level the body maintains.",
+     ["SLC23A1", "SLC23A2"]),
+    ("Vitamin D",
+     "Affects vitamin D synthesis, transport, activation, and breakdown; a major driver of circulating vitamin D levels.",
+     ["GC", "VDR", "CYP2R1", "CYP27B1", "CYP24A1", "DHCR7", "NADSYN1"]),
+    ("Vitamin E",
+     "Affects how vitamin E (tocopherol) is carried and distributed in blood.",
+     ["TTPA", "APOA5", "SCARB1", "CD36", "ZNF259", "BUD13"]),
+    ("Vitamin K",
+     "Affects vitamin K recycling and the activation of clotting and bone proteins (and warfarin response).",
+     ["GGCX", "VKORC1", "CYP4F2"]),
+    ("Calcium",
+     "Affects calcium sensing, absorption, and regulation in blood and bone.",
+     ["CASR", "GCKR", "WDR81", "DGKD", "CARS"]),
+    ("Magnesium",
+     "Affects magnesium reabsorption and transport in the kidney and gut.",
+     ["TRPM6", "TRPM7", "CNNM2", "SHROOM3", "ATP2B1", "SLC41A1", "MUC1"]),
+    ("Sodium",
+     "Affects sodium handling and salt sensitivity of blood pressure.",
+     ["ADD1", "AGT", "CYP11B2", "SLC12A3", "GNB3", "NR3C2", "SCNN1B"]),
+    ("Potassium",
+     "Affects potassium handling in the kidney.",
+     ["KCNJ1", "SLC12A1", "WNK1", "WNK4"]),
+    ("Iron",
+     "Affects iron absorption, transport, and storage; some variants raise the risk of iron overload.",
+     ["HFE", "TMPRSS6", "TF", "TFR2", "TFRC", "SLC40A1", "HAMP", "BMP2", "FTL", "FTH1", "ARSB"]),
+    ("Zinc",
+     "Affects zinc transport and cellular zinc balance.",
+     ["SLC30A8", "SLC30A3"]),
+    ("Copper",
+     "Affects copper transport and incorporation into ceruloplasmin; rare variants cause copper-handling disorders.",
+     ["CP", "ATP7A", "ATP7B", "SLC31A1"]),
+    ("Manganese",
+     "Affects manganese transport; variants can shift manganese toward deficiency or overload.",
+     ["SLC30A10", "SLC39A14", "SLC39A8"]),
+    ("Iodine",
+     "Affects iodine uptake and thyroid-hormone production that depends on it.",
+     ["SLC5A5", "TPO", "TG", "DIO1", "DIO2"]),
+    ("Selenium",
+     "Affects selenium transport and the selenoprotein antioxidant enzymes that use it.",
+     ["GPX1", "SELENOP", "SEPP1", "SELENBP1"]),
+    ("Molybdenum",
+     "Affects synthesis of the molybdenum cofactor required by sulfite oxidase and related enzymes.",
+     ["MOCS1", "MOCS2", "GPHN", "SUOX"]),
+]
+
+# Chromium is the one nutrient with no gene to show: no human gene is robustly
+# established to affect chromium status, so it stays an honest placeholder.
+NUTRIENTS_LIMITED = {
+    "Chromium":
+        "No human gene is robustly established to affect chromium status, so there are no variants to report.",
+}
+
+# Build lookups and fold nutrient genes into GENE_FUNCTION (nutrient labels win).
+NUTRIENT_ORDER = [n[0] for n in NUTRIENTS]
+NUTRIENT_OF_GENE = {}
+NUTRIENT_BASELINE = {}
+for _label, _note, _genes in NUTRIENTS:
+    NUTRIENT_BASELINE[_label] = _note
+    for _g in _genes:
+        gu = _g.upper()
+        NUTRIENT_OF_GENE[gu] = _label
+        # nutrient assignment is authoritative for label + baseline
+        GENE_FUNCTION[gu] = (_label, _note)
+
+
+def nutrient_of(gene):
+    """Return the nutrient label for a gene, or None if it isn't a nutrient gene."""
+    return NUTRIENT_OF_GENE.get(_canon(gene))
+
+
+def is_nutrient_gene(gene):
+    return _canon(gene) in NUTRIENT_OF_GENE
+
+
+# The FULL fixed panel, in the exact order requested, so EVERY nutrient appears
+# in every report — with the user's variants if any were found, else an honest
+# "not assessed in your data" row. B3/Niacin and Chromium have no usable common
+# variants; Vitamin C transporters are rarely on consumer chips.
+PANEL_ORDER = [
+    "Vitamin A", "Vitamin B1 (Thiamine)", "Vitamin B2 (Riboflavin)",
+    "Vitamin B3 (Niacin)", "Vitamin B5 (Pantothenic Acid)", "Vitamin B6",
+    "Vitamin B7 (Biotin)", "Vitamin B9 (Folate)", "Vitamin B12", "Vitamin C",
+    "Vitamin D", "Vitamin E", "Vitamin K",
+    "Calcium", "Magnesium", "Sodium", "Potassium", "Iron", "Zinc", "Copper",
+    "Manganese", "Iodine", "Selenium", "Chromium", "Molybdenum",
+]
+
+
+def panel_empty_note(label):
+    """Note shown when no variant for this nutrient was found in the user's data."""
+    if label in NUTRIENTS_LIMITED:
+        return NUTRIENTS_LIMITED[label]
+    base = NUTRIENT_BASELINE.get(label, "")
+    lead = "No variants affecting this nutrient were found in your uploaded data."
+    return f"{lead} {base}".strip()
