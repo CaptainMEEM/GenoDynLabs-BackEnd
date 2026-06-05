@@ -152,6 +152,15 @@ def annotate_variant(user_geno, snp_record, option):
     repute = (option.get("repute") or "neutral").strip() or "neutral"
     mag = option.get("mag") or 0.0
 
+    # ClinVar-style pathogenicity carried on any catalog entry (from deana).
+    pathogenic = ""
+    for a in snp_record.get("catalog", []):
+        sig = str(a.get("sig", "") or "")
+        low = sig.lower()
+        if "pathogenic" in low and "conflict" not in low and "non-patho" not in low:
+            pathogenic = sig
+            break
+
     assocs = _collect_assocs(snp_record)
     effect, eff_or, top_trait = _best_effect_allele(assocs, user_geno)
 
@@ -202,7 +211,15 @@ def annotate_variant(user_geno, snp_record, option):
     if note and not note.endswith((".", "!", "?")):
         note += "."
 
+    # Surface clinical pathogenicity prominently.
+    if pathogenic:
+        tag = "Likely pathogenic" if "likely" in pathogenic.lower() and \
+              "/" not in pathogenic else pathogenic
+        note = f"ClinVar: {tag}. " + note
+
     hl = _highlight(effect, user_geno, repute)
+    if pathogenic and user_geno not in ("--", ""):
+        hl = "hl-orange"
 
     return {
         "note": note,
@@ -214,6 +231,7 @@ def annotate_variant(user_geno, snp_record, option):
         "repute": repute,
         "hl": hl,
         "gene": gene,
+        "pathogenic": bool(pathogenic),
         "label": gene_labels.label(gene, fallback_trait=top_trait),
         "label_known": gene_labels.is_known(gene),
     }
