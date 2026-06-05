@@ -55,6 +55,7 @@ Run:
         data/equilibrium_df.csv data/reference.pkl
 """
 import re
+import os
 import sys
 import pickle
 from collections import defaultdict
@@ -265,6 +266,202 @@ def attach_catalog(snps, trait_csv):
     return snps
 
 
+# ------------------------------------------------- deana nutrient enrichment
+# We pull ONLY nutrient level/status associations from the deana evidence pack
+# (a few thousand records) so the bundle stays small and the rest of the report
+# is unchanged. Each becomes a catalog-style association on its SNP, tagged with
+# the nutrient so the report routes it into the Vitamins & Minerals panel.
+
+# Trait-name -> nutrient (panel label). Matched on the record TITLE, and the
+# title must also contain a level/status word, so we only ingest genuine
+# circulating-level associations (not unrelated clinical variants).
+import re as _re
+_NUTRIENT_TRAIT = [
+    ("Vitamin A", _re.compile(r"\bretinol\b|beta-?carotene|\bvitamin a\b|carotenoid", _re.I)),
+    ("Vitamin B2 (Riboflavin)", _re.compile(r"riboflavin", _re.I)),
+    ("Vitamin B6", _re.compile(r"pyridoxal|pyridoxine|\bvitamin b6\b|\bPLP\b", _re.I)),
+    ("Vitamin B9 (Folate)", _re.compile(r"\bfolate\b|folic acid", _re.I)),
+    ("Vitamin B12", _re.compile(r"\bvitamin b-?12\b|\bb12\b|cobalamin", _re.I)),
+    ("Vitamin C", _re.compile(r"ascorb|\bvitamin c\b", _re.I)),
+    ("Vitamin D", _re.compile(r"\bvitamin d\b|25-?hydroxyvitamin|calcidiol", _re.I)),
+    ("Vitamin E", _re.compile(r"\bvitamin e\b|tocopherol|tocotrienol", _re.I)),
+    ("Vitamin K", _re.compile(r"phylloquinone|\bvitamin k\b|menaquinone", _re.I)),
+    ("Calcium", _re.compile(r"\bcalcium\b", _re.I)),
+    ("Magnesium", _re.compile(r"magnesium", _re.I)),
+    ("Sodium", _re.compile(r"\bsodium\b", _re.I)),
+    ("Potassium", _re.compile(r"potassium", _re.I)),
+    ("Iron", _re.compile(r"\biron\b|ferritin|transferrin saturation|iron status", _re.I)),
+    ("Zinc", _re.compile(r"\bzinc\b", _re.I)),
+    ("Copper", _re.compile(r"\bcopper\b|ceruloplasmin", _re.I)),
+    ("Manganese", _re.compile(r"manganese", _re.I)),
+    ("Iodine", _re.compile(r"\biodine\b", _re.I)),
+    ("Selenium", _re.compile(r"selenium", _re.I)),
+    ("Molybdenum", _re.compile(r"molybden", _re.I)),
+]
+_LEVEL_WORD = _re.compile(
+    r"level|status|concentration|plasma|serum|circulating|biomarker", _re.I)
+# avoid a couple of well-known false positives that contain a nutrient word
+_TRAIT_EXCLUDE = _re.compile(
+    r"coronary artery calc|arterial calc|valve calc|channel blocker", _re.I)
+
+
+def _nutrient_for_trait(title):
+    if not title or _TRAIT_EXCLUDE.search(title) or not _LEVEL_WORD.search(title):
+        return None
+    for label, rx in _NUTRIENT_TRAIT:
+        if rx.search(title):
+            return label
+    return None
+
+
+def attach_deana_nutrients(snps, deana_shards_dir, max_assoc_per_snp=6):
+    """Fold nutrient level/status associations from the deana evidence pack into
+    `snps`. Streams shard JSON files one at a time (build-time only) and keeps
+    only nutrient-relevant records, so memory and bundle size stay small.
+
+    Each match: ensures the SNP record exists, tags it with `nutrient` (panel
+    routing), and appends a catalog-style association the note engine already
+    understands. New nutrient rsids become matchable; everything else is ignored
+    so the rest of the report is unchanged."""
+    import glob
+    import json
+    shard_files = sorted(glob.glob(os.path.join(deana_shards_dir, "*.json")))
+    if not shard_files:
+        print(f"  (no deana shards found in {deana_shards_dir}; skipping)")
+        return snps
+
+    added_records = 0
+    enriched_snps = set()
+    seen = set()                       # (rsid, trait) de-dup
+    for sf in shard_files:
+        try:
+            with open(sf) as fh:
+                recs = json.load(fh)
+        except Exception:
+            continue
+        for r in recs:
+            title = r.get("title", "")
+            nut = _nutrient_for_trait(title)
+            if not nut:
+                continue
+            trait = title.split(" association near")[0].strip()
+            risk = (r.get("riskAllele") or "").strip().upper()
+            if risk in ("NR", "NONE", "?", "NAN"):
+                risk = ""
+            genes_raw = r.get("genes") or []
+            gene = ""
+            for g in genes_raw:
+                gene = str(g).replace(" - ", "/").split("/")[0].strip()
+                if gene:
+                    break
+            for rsid in r.get("markerIds", []):
+                if not rsid or not rsid.startswith("rs"):
+                    continue
+                key = (rsid, trait.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                # Only ADD genuinely new nutrient-level SNPs. If the rsid already
+                # exists in our reference it has an established meaning/topic
+                # (e.g. APOE = Alzheimer); we never re-tag it, so the rest of the
+                # report is unchanged and no variant gets hijacked into the panel.
+                if rsid in snps:
+                    continue
+                rec = {"rsid": rsid, "gene": gene, "genes": genes_raw,
+                       "chr": "", "pos": "", "orientation": "", "gmaf": None,
+                       "gwas": [], "catalog": [], "options": {},
+                       "nutrient": nut}
+                snps[rsid] = rec
+                added_records += 1
+                rec["catalog"].append({
+                    "trait": trait, "risk": risk, "or": None,
+                    "range": "", "pval": "", "gene": gene, "raf": {},
+                    "source": "deana", "evidence": r.get("evidenceLevel", ""),
+                    "repute": r.get("repute", ""),
+                })
+                enriched_snps.add(rsid)
+    print(f"  deana nutrient associations: {len(enriched_snps):,} SNPs "
+          f"enriched ({added_records:,} newly added)")
+    return snps
+
+
+def attach_deana_general(snps, deana_shards_dir, levels=("high", "moderate")):
+    """Fold the BROADER deana evidence pack (clinical + GWAS) into the bundle so
+    that unique user uploads get matched and annotated. To stay lean we keep
+    only `levels` evidence (default high+moderate, dropping ~80k weak
+    'supplementary' records) and only ADD new rsids (never touch existing ones,
+    so the curated sections and SNPedia notes are unchanged). Each new SNP gets
+    one compact catalog entry carrying the trait and, crucially, the ClinVar
+    clinical significance so pathogenic findings can be flagged."""
+    import glob
+    import json
+    levels = set(levels)
+    shard_files = sorted(glob.glob(os.path.join(deana_shards_dir, "*.json")))
+    if not shard_files:
+        print(f"  (no deana shards in {deana_shards_dir}; skipping general merge)")
+        return snps
+    added = 0
+    for sf in shard_files:
+        try:
+            recs = json.load(open(sf))
+        except Exception:
+            continue
+        for r in recs:
+            if r.get("evidenceLevel") not in levels:
+                continue
+            ids = [m for m in r.get("markerIds", []) if m and m.startswith("rs")]
+            if not ids:
+                continue
+            title = (r.get("title") or "").strip()
+            trait = title.split(" association near")[0].strip()[:80]
+            risk = (r.get("riskAllele") or "").strip().upper()
+            if risk in ("NR", "NONE", "?", "NAN"):
+                risk = ""
+            gene = ""
+            for g in (r.get("genes") or []):
+                gene = str(g).replace(" - ", "/").split("/")[0].strip()
+                if gene:
+                    break
+            sig = r.get("clinicalSignificance") or ""
+            for rsid in ids:
+                if rsid in snps:                 # never overwrite existing
+                    continue
+                snps[rsid] = {
+                    "rsid": rsid, "gene": gene, "genes": ([gene] if gene else []),
+                    "chr": "", "pos": "", "orientation": "", "gmaf": None,
+                    "gwas": [], "options": {},
+                    "catalog": [{"trait": trait, "risk": risk, "or": None,
+                                 "range": "", "pval": "", "gene": gene, "raf": {},
+                                 "source": "deana", "sig": sig,
+                                 "evidence": r.get("evidenceLevel", "")}],
+                }
+                added += 1
+    print(f"  deana general merge ({'+'.join(sorted(levels))}): +{added:,} new SNPs")
+    return snps
+
+
+def ensure_curated(snps, curated_map, baselines):
+    """Guarantee every user-specified variant ID is present and matchable. IDs
+    already in the bundle keep their data; missing ones get a stub carrying the
+    category baseline note (so there is always *some* notation)."""
+    added = 0
+    for rsid, (label, _topic) in curated_map.items():
+        if rsid in snps:
+            continue
+        note = baselines.get(label, "A user-specified variant.")
+        snps[rsid] = {
+            "rsid": rsid, "gene": "", "genes": [],
+            "chr": "", "pos": "", "orientation": "", "gmaf": None,
+            "gwas": [], "options": {},
+            "catalog": [{"trait": note, "risk": "", "or": None, "range": "",
+                         "pval": "", "gene": "", "raf": {}, "source": "curated"}],
+        }
+        added += 1
+    print(f"  curated variants ensured present: +{added:,} stubs "
+          f"({len(curated_map)} total IDs)")
+    return snps
+
+
 # ------------------------------------------------------- equilibrium parsing
 
 def build_ld(eq_csv, threshold=LD_THRESHOLD):
@@ -282,7 +479,8 @@ def build_ld(eq_csv, threshold=LD_THRESHOLD):
 
 # --------------------------------------------------------------------- build
 
-def build(snp_csv, geno_csv, trait_csv, eq_csv, out_pkl):
+def build(snp_csv, geno_csv, trait_csv, eq_csv, out_pkl, deana_dir=None,
+          deana_levels=("high", "moderate")):
     print("parsing SNP pages ...")
     snps = parse_snps(snp_csv)
     print(f"  {len(snps):,} SNP pages")
@@ -292,6 +490,21 @@ def build(snp_csv, geno_csv, trait_csv, eq_csv, out_pkl):
 
     print("attaching GWAS-Catalog associations ...")
     attach_catalog(snps, trait_csv)
+
+    if deana_dir:
+        print("attaching deana nutrient-level associations ...")
+        attach_deana_nutrients(snps, deana_dir)
+        if deana_levels:
+            print("attaching deana general evidence (broad coverage) ...")
+            attach_deana_general(snps, deana_dir, levels=deana_levels)
+
+    # Guarantee the user-specified variant IDs are present and routed.
+    try:
+        from . import curated as _curated
+    except ImportError:
+        import curated as _curated
+    print("ensuring curated variant IDs ...")
+    ensure_curated(snps, _curated.CURATED_VARIANTS, _curated.CURATED_BASELINE)
 
     print("building linkage map ...")
     ld = build_ld(eq_csv)
@@ -320,4 +533,12 @@ if __name__ == "__main__":
     trait = args[2] if len(args) > 2 else "data/trait_df.csv"
     eq = args[3] if len(args) > 3 else "data/equilibrium_df.csv"
     out = args[4] if len(args) > 4 else "data/reference.pkl"
-    build(snp, geno, trait, eq, out)
+    # optional 6th arg: deana evidence-pack shards dir; 7th: evidence levels for
+    # the broad merge ("high,moderate" default; "high" leaner; "none" to disable)
+    deana = args[5] if len(args) > 5 else None
+    if len(args) > 6:
+        lv = args[6].strip().lower()
+        deana_levels = () if lv in ("none", "off", "") else tuple(lv.split(","))
+    else:
+        deana_levels = ("high", "moderate")
+    build(snp, geno, trait, eq, out, deana_dir=deana, deana_levels=deana_levels)
