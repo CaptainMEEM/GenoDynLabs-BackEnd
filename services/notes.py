@@ -1,544 +1,352 @@
 """
-precompute_reference.py  --  Build the rich reference bundle ONCE at deploy time.
+notes.py  --  Layered note synthesis. The engine that fixes "bad notes".
 
-This is the single most important file for report quality. The OLD version threw
-away ~90% of SNPedia's content (it kept only gene/chr/pos/orientation per SNP and
-geno/mag/repute/summary per genotype), which is why ~63% of genotype notes came
-out blank or boilerplate.
+For every matched variant we assemble the single best note we can from ALL of
+SNPedia/GWAS, in priority order, and we GUARANTEE a meaningful note for every
+gene pair. The layers, highest priority first:
 
-This version mines EVERYTHING the four SNPedia/GWAS dumps contain and folds it
-into one compact, rsid-keyed pickle so the worker never touches the 33 MB raw
-files or runs a regex at request time:
+  1. Genotype summary      (geno_df)  -- the per-genotype sentence, when it is
+                                          real (not "common in clinvar" filler).
+  2. SNP-page GWAS          (snp_df)  -- named trait + your-dosage direction + OR.
+  3. GWAS-Catalog assoc.  (trait_df)  -- study-backed trait + risk allele + OR.
+  4. Curated gene function (gene_labels) -- always-true "what this gene does".
+  5. Genotype-page desc.   (geno_df)  -- cleaned page text, last resort.
 
-  snp_df.csv          (SNP pages)        -> gene(s), chr, pos, orientation, GMAF,
-                                            and every {{PMID Auto GWAS}} block
-                                            (trait, risk allele, OR, study title)
-  geno_df.csv         (genotype pages)   -> per-genotype mag, repute, summary, desc
-  trait_df.csv        (GWAS Catalog)     -> risk allele, OR, named trait, population
-                                            allele frequencies (per-rsid)
-  equilibrium_df.csv  (LD r^2)           -> linkage map for de-duplication
+We also compute the effect allele to show, the user's dosage of it, and a
+highlight class, all from the same evidence the note is built from -- so the
+"Effect" / "Your Genotype" columns and the note always agree.
 
-Output schema (reference.pkl):
-
-    {
-      "version": "2.0",
-      "snps": {
-        "rs602662": {
-          "rsid": "rs602662",
-          "gene": "FUT2",
-          "genes": ["FUT2"],
-          "chr": "19", "pos": "48703417",
-          "orientation": "minus",
-          "gmaf": 0.43,
-          "gwas": [
-            {"trait": "Folate pathway vitamins", "risk": "G",
-             "or": 1.20, "title": "...", "pval": "3E-12"}
-          ],
-          "catalog": [            # from trait_df (GWAS Catalog)
-            {"trait": "Vitamin B12 levels", "risk": "G", "or": 1.31,
-             "range": "[1.2-1.4]", "pval": "...", "raf": {"European": 0.49, ...}}
-          ],
-          "options": {            # keyed by SORTED genotype, e.g. "AG"
-            "GG": {"mag": 2.0, "repute": "Good",
-                   "summary": "Higher vitamin B12 levels", "desc": "..."},
-            ...
-          }
-        },
-        ...
-      },
-      "ld": { "rs1234": ["rs5678", ...], ... }   # r^2 >= LD_THRESHOLD
-    }
-
-Run:
-    python -m services.precompute_reference \
-        data/snp_df.csv data/geno_df.csv data/trait_df.csv \
-        data/equilibrium_df.csv data/reference.pkl
+Public entry point:
+    annotate_variant(user_geno, snp_record, genotype_option) -> dict
 """
 import re
-import os
-import sys
-import pickle
-from collections import defaultdict
 
-import pandas as pd
+try:
+    from . import gene_labels
+except ImportError:                       # standalone / testing
+    import gene_labels
 
-LD_THRESHOLD = 0.8          # only keep tight linkage in the pickle (dedup use)
-MAX_GWAS_PER_SNP = 6        # cap associations so notes stay readable
-MAX_SUMMARY_LEN = 320       # genotype summaries are short; keep them whole-ish
+ARROW_UP = "\u2191"     # ↑
+ARROW_DN = "\u2193"     # ↓
 
-
-# ---------------------------------------------------------------- field utils
-# SNPedia dumps use `$` for newlines and `|` to separate fields inside {{ }}.
-
-def _field(name, text):
-    """First value of `name=...` inside a SNPedia template blob."""
-    m = re.search(r"%s=([^$|}]+)" % re.escape(name), text or "")
-    return m.group(1).strip() if m else ""
-
-
-def _to_float(x):
-    try:
-        v = float(x)
-        return v if v == v else None        # filter NaN
-    except (TypeError, ValueError):
-        return None
+# Genotype summaries that carry no biological signal. Matched as the WHOLE
+# string so a real note that merely begins with "Common variant..." survives.
+# "common in <anything>" (clinvar / complete genomics / 1000 genomes / ...) and
+# bare "normal"/"benign"/"none" are all filler.
+_BOILER = re.compile(
+    r"(?i)^\s*("
+    r"common(\s+(in|on)\b.*|/\w+)?|"
+    r"normal|none|n/?a|unknown|"
+    r"benign|likely\s+benign|uncertain\s+significance|"
+    r"no\s+\w+|not\s+\w+|wild\s*type|reference"
+    r")\s*\.?\s*$"
+)
 
 
-def _clean_text(text, limit=MAX_SUMMARY_LEN):
-    """Strip SNPedia/wiki markup down to a clean human sentence."""
+def _is_boiler(summary):
+    return (not summary) or bool(_BOILER.match(summary))
+
+
+# Strip any allele / genotype / odds-ratio jargon out of free-text summaries so
+# the reader sees a plain implication, never "the G allele" or "OR 1.31".
+_SCRUB_PATTERNS = [
+    re.compile(r"(?i)\b(\d+\s+)?cop(y|ies)\s+of\s+the\s+[ACGT]{1,2}\s+(risk\s+)?allele"),
+    re.compile(r"(?i)\bthe\s+[ACGT]{1,2}\s+(risk\s+)?allele\b"),
+    re.compile(r"(?i)\b[ACGT]{1,2}\s+risk\s+allele\b"),
+    re.compile(r"(?i)\b(odds\s+ratio|OR)\s*[:=]?\s*\d+(\.\d+)?"),
+    re.compile(r"(?i)\bp\s*[=<]\s*\d[\d.eE+-]*"),
+    re.compile(r"(?i)\bgenotyp\w*\b"),
+    # strip any supplementation suggestion (user: no supplement notation anywhere)
+    re.compile(r"(?i)\s*[;,\u2014\-]?\s*\b(consider\s+)?supplement\w*\b[^.?!]*[.?!]?"),
+    re.compile(r"\((?:\s*[\u2191\u2193]\s*)?\)"),     # empty arrow parens
+]
+
+
+def _scrub(text):
     if not text:
         return ""
-    s = re.sub(r"\{\{[^}]*\}\}", " ", text)       # drop template blocks
-    s = re.sub(r"\[\[([^\]|]+\|)?([^\]]+)\]\]", r"\2", s)  # [[a|b]] -> b
-    s = s.replace("$", " ")
-    s = re.sub(r"\s+", " ", s).strip(" .;,-|")
-    if len(s) > limit:
-        s = s[:limit].rsplit(" ", 1)[0] + "\u2026"
+    s = text
+    for rx in _SCRUB_PATTERNS:
+        s = rx.sub("", s)
+    s = re.sub(r"\s*[\u2014\-]\s*$", "", s)       # dangling dash
+    s = re.sub(r"\s+([:;,.])", r"\1", s)          # space before punctuation
+    s = re.sub(r"[:;,]\s*$", "", s)               # dangling colon/comma
+    s = re.sub(r"\s{2,}", " ", s).strip(" .;,-\u2014")
     return s
 
 
-# ------------------------------------------------------------ snp_df parsing
-
-def _parse_snp_page(text):
-    """Return (rsid, record) mined from one SNP wiki page, or (None, None)."""
-    rsnum = _field("rsid", text)
-    if not rsnum:
-        return None, None
-    rsid = "rs" + rsnum
-
-    genes_raw = _field("Gene_s", text) or _field("Gene", text)
-    genes = [g.strip() for g in re.split(r"[,;]", genes_raw) if g.strip()]
-    primary = _field("Gene", text) or (genes[0] if genes else "")
-
-    # Every GWAS association attached to this SNP page.
-    gwas = []
-    for block in re.findall(r"\{\{PMID Auto GWAS(.*?)\}\}", text, re.DOTALL):
-        trait = _field("Trait", block)
-        if not trait or trait.lower() in ("none", "nr", ""):
-            continue
-        risk = _field("RiskAllele", block).upper()
-        if risk in ("NR", "NONE", "?"):
-            risk = ""
-        gwas.append({
-            "trait": trait,
-            "risk": risk,
-            "or": _to_float(_field("OR", block)),
-            "title": _field("Title", block),
-            "pval": _field("Pval", block),
-        })
-    # de-dup identical (trait, risk) keeping the most extreme OR; cap length
-    seen = {}
-    for g in gwas:
-        key = (g["trait"].lower(), g["risk"])
-        prev = seen.get(key)
-        if prev is None or abs((g["or"] or 1) - 1) > abs((prev["or"] or 1) - 1):
-            seen[key] = g
-    gwas = sorted(seen.values(),
-                  key=lambda g: abs((g["or"] or 1) - 1), reverse=True)[:MAX_GWAS_PER_SNP]
-
-    rec = {
-        "rsid": rsid,
-        "gene": primary,
-        "genes": genes,
-        "chr": _field("Chromosome", text),
-        "pos": _field("position", text),
-        "orientation": (_field("StabilizedOrientation", text)
-                        or _field("Orientation", text)).lower(),
-        "gmaf": _to_float(_field("GMAF", text)),
-        "gwas": gwas,
-        "catalog": [],          # filled from trait_df later
-        "options": {},          # filled from geno_df later
-    }
-    return rsid, rec
+def _or_phrase(orv):
+    """Readable OR clause. Values outside [0.1, 10] are almost always effect
+    sizes on continuous traits (metabolite/biomarker levels), not true
+    case/control odds ratios, so we show direction only rather than a
+    misleading number like 'OR 49.77'. (Same bounds ModernPromethease used.)"""
+    if not orv:
+        return ""
+    arrow = ARROW_DN if orv < 1 else ARROW_UP
+    if orv < 0.1 or orv > 10:
+        return arrow            # direction only; magnitude not trustworthy
+    return f"{arrow} OR {orv:.2f}"
 
 
-def parse_snps(snp_csv):
-    snps = {}
-    df = pd.read_csv(snp_csv)
-    for text in df["text"].dropna():
-        rsid, rec = _parse_snp_page(str(text))
-        if rsid:
-            snps[rsid] = rec
-    return snps
+def _dosage(user_geno, allele):
+    """How many copies of `allele` the user carries (0/1/2), or None if unknown."""
+    if not allele or not user_geno or user_geno in ("--", ""):
+        return None
+    return user_geno.count(allele)
 
 
-# ----------------------------------------------------------- geno_df parsing
-
-def _parse_genotype_cell(text):
-    """Return (rsid, sorted_geno, option) for one genotype page cell."""
-    if not text or text == "none":
-        return None, None, None
-    rsnum = _field("rsid", text)
-    a1, a2 = _field("allele1", text), _field("allele2", text)
-    geno = "".join(sorted([a1, a2])).lstrip("=").strip()
-    if not rsnum or not geno:
-        return None, None, None
-    summary = _field("summary", text)
-    opt = {
-        "mag": _to_float(_field("magnitude", text)) or 0.0,
-        "repute": (_field("repute", text) or "neutral"),
-        "summary": _clean_text(summary) if summary else "",
-        # full-page text minus the template noise; a richer fallback note
-        "desc": _clean_text(text, limit=MAX_SUMMARY_LEN) if not summary else "",
-    }
-    return "rs" + rsnum, geno, opt
+# Words that mark a "level/biomarker" trait (phrased as higher/lower levels)
+# vs. a disease/risk trait (phrased as an X-times risk).
+_LEVEL_RX = re.compile(
+    r"(?i)\b(level|levels|concentration|status|biomarker|metabolite|"
+    r"vitamin|folate|homocysteine|ferritin|cholesterol|amino acid|"
+    r"glycosylation|fatty acid)\b")
 
 
-def attach_genotypes(snps, geno_csv):
-    """Fold every genotype option into the matching SNP record.
+def _clean_trait(trait):
+    """Tidy a trait string for human reading."""
+    t = (trait or "").split(" association near")[0].strip()
+    t = re.sub(r"\s+", " ", t).strip(" .;,-")
+    return t
 
-    A genotype page may reference an rsid that has no SNP page; in that case we
-    create a minimal SNP record so the variant is never silently dropped.
+
+# State words that already describe a condition -> never append "levels" to them.
+_STATE_RX = re.compile(
+    r"(?i)(insufficien|deficien|disease|syndrome|intoleran|disorder|cancer|"
+    r"\brisk\b|tolerance|persistence|flush|sensitivity)")
+
+# Stop-words that don't identify the topic of a trait (used for de-duplication).
+_STOP = {"level", "levels", "status", "concentration", "plasma", "serum",
+         "blood", "total", "risk", "trait", "traits", "disease", "association",
+         "circulating", "biomarker", "biomarkers", "values", "value", "higher",
+         "lower", "with"}
+
+
+def _core_terms(text):
+    """The topic-identifying words in a trait/summary, for de-dup by subject."""
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) > 3 and w not in _STOP}
+
+
+def _noun_form(trait):
+    """Trait phrased as a noun for 'higher/lower ___'. Adds 'levels' only when
+    the trait is a measurable quantity, never to a state word like 'deficiency'."""
+    low = trait.lower()
+    if _STATE_RX.search(low) or "level" in low or "status" in low or \
+       "concentration" in low:
+        return trait
+    return trait + " levels"
+
+
+def _risk_multiplier(orv):
+    """Turn an odds ratio into a plain 'X times higher/lower risk' phrase, but
+    only when it is a believable case/control OR (roughly 1.1-10x). Returns ''
+    when the number isn't a trustworthy risk multiplier."""
+    if not orv or orv <= 0:
+        return ""
+    if 1.1 <= orv <= 10:
+        return f"about {orv:.1f}\u00d7 higher risk"
+    if 0.1 <= orv <= 0.91:
+        return f"about {1.0 / orv:.1f}\u00d7 lower risk"
+    return ""               # ~1.0 (no effect) or implausible -> no multiplier
+
+
+def _implication(trait, risk, orv, user_geno, allow_typical=True):
+    """Plain-language implication for one association, with NO allele/copy talk.
+
+    - Level/biomarker traits  -> 'Linked to higher/lower <trait>' (direction from
+      the odds ratio); 'Typical <trait>' when the user doesn't carry the variant
+      (only if allow_typical).
+    - Disease/risk traits     -> 'About 1.5x higher risk of <disease>' when the
+      user carries the effect allele and the OR is a believable multiplier;
+      otherwise 'Associated with <disease>'. Never states a risk for a variant
+      the user does not carry.
+    Trait case is preserved (so 'LDL', 'Alzheimer' stay correct).
     """
-    df = pd.read_csv(geno_csv)
-    for row in df.itertuples(index=False):
-        for cell in (row.gt1, row.gt2, row.gt3):
-            rsid, geno, opt = _parse_genotype_cell(str(cell))
-            if not rsid:
-                continue
-            rec = snps.get(rsid)
-            if rec is None:
-                rec = {"rsid": rsid, "gene": "", "genes": [], "chr": "",
-                       "pos": "", "orientation": "", "gmaf": None,
-                       "gwas": [], "catalog": [], "options": {}}
-                snps[rsid] = rec
-            rec["options"][geno] = opt
-    return snps
+    trait = _clean_trait(trait)
+    if not trait:
+        return ""
+    dose = _dosage(user_geno, risk)            # used only to decide IF it applies
+    is_level = bool(_LEVEL_RX.search(trait)) and not _STATE_RX.search(trait)
+
+    if is_level:
+        noun = _noun_form(trait)
+        if dose is None:                       # no allele info -> generic
+            return f"Associated with {noun}"
+        if dose == 0:
+            return f"Typical {noun}" if allow_typical else ""
+        if orv and orv > 1:
+            return f"Linked to higher {noun}"
+        if orv and orv < 1:
+            return f"Linked to lower {noun}"
+        return f"Linked to altered {noun}"
+
+    # disease / risk / state trait
+    if dose == 0:
+        return ""                              # user doesn't carry it -> don't state
+    mult = _risk_multiplier(orv)
+    if mult and dose:
+        return f"{mult[0].upper()}{mult[1:]} of {trait}"
+    if dose or dose is None:
+        return f"Associated with {trait}"
+    return ""
 
 
-# ---------------------------------------------------------- trait_df parsing
-
-_POP_COLS = ["Global", "European", "African", "AfricanOthers", "AfricanAmerican",
-             "Asian", "EastAsian", "OtherAsian", "LatinAmerican1",
-             "LatinAmerican2", "SouthAsian", "Other"]
-
-
-def attach_catalog(snps, trait_csv):
-    """Fold GWAS-Catalog rows (trait_df) into each SNP's `catalog` list.
-
-    These carry the most trustworthy, study-backed effect sizes and the
-    population allele frequencies the trait report uses. We keep the strongest
-    few per rsid (smallest p-value)."""
-    td = pd.read_csv(trait_csv)
-    td["_p"] = pd.to_numeric(td.get("pval"), errors="coerce")
-    for rsid, grp in td.groupby("rsid"):
-        rec = snps.get(rsid)
-        grp = grp.sort_values("_p", na_position="last")
-        cats = []
-        seen = set()
-        for r in grp.itertuples(index=False):
-            trait = str(getattr(r, "trait", "") or "").strip()
-            if not trait or trait.lower() in ("nan", "none", "nr"):
+def _collect_assocs(snp_record):
+    """Merge SNP-page GWAS + GWAS-Catalog associations, strongest first,
+    de-duplicated by trait. Catalog (study-backed) wins ties."""
+    merged = {}
+    for src in (snp_record.get("catalog", []), snp_record.get("gwas", [])):
+        for a in src:
+            trait = (a.get("trait") or "").strip()
+            if not trait:
                 continue
             key = trait.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            raf = {}
-            for c in _POP_COLS:
-                v = _to_float(getattr(r, c, None))
-                if v is not None and 0 < v < 1:
-                    raf[c] = round(v, 4)
-            risk = str(getattr(r, "risk_allele", "") or "").strip().upper()
-            if risk in ("NR", "NONE", "?", "NAN"):
-                risk = ""
-            cats.append({
-                "trait": trait,
-                "risk": risk,
-                "or": _to_float(getattr(r, "OR", None)),
-                "range": str(getattr(r, "range", "") or "").strip(),
-                "pval": str(getattr(r, "pval", "") or "").strip(),
-                "gene": str(getattr(r, "gene", "") or "").strip(),
-                "raf": raf,
-            })
-            if len(cats) >= 6:
-                break
-        if rec is None:
-            # rsid known to GWAS Catalog but absent from SNPedia: keep a stub so
-            # the trait association can still surface if the user is genotyped.
-            rec = {"rsid": rsid, "gene": cats[0]["gene"] if cats else "",
-                   "genes": [], "chr": "", "pos": "", "orientation": "",
-                   "gmaf": None, "gwas": [], "catalog": [], "options": {}}
-            snps[rsid] = rec
-        rec["catalog"] = cats
-        if not rec["gene"] and cats and cats[0]["gene"]:
-            rec["gene"] = cats[0]["gene"]
-    return snps
+            orv = a.get("or")
+            keep = merged.get(key)
+            if keep is None:
+                merged[key] = {"trait": trait, "risk": a.get("risk", ""), "or": orv}
+            else:
+                # prefer an entry that actually has an OR / risk allele
+                if keep.get("or") is None and orv is not None:
+                    keep["or"] = orv
+                if not keep.get("risk") and a.get("risk"):
+                    keep["risk"] = a.get("risk")
+    return sorted(merged.values(),
+                  key=lambda a: abs((a["or"] or 1) - 1), reverse=True)
 
 
-# ------------------------------------------------- deana nutrient enrichment
-# We pull ONLY nutrient level/status associations from the deana evidence pack
-# (a few thousand records) so the bundle stays small and the rest of the report
-# is unchanged. Each becomes a catalog-style association on its SNP, tagged with
-# the nutrient so the report routes it into the Vitamins & Minerals panel.
-
-# Trait-name -> nutrient (panel label). Matched on the record TITLE, and the
-# title must also contain a level/status word, so we only ingest genuine
-# circulating-level associations (not unrelated clinical variants).
-import re as _re
-_NUTRIENT_TRAIT = [
-    ("Vitamin A", _re.compile(r"\bretinol\b|beta-?carotene|\bvitamin a\b|carotenoid", _re.I)),
-    ("Vitamin B2 (Riboflavin)", _re.compile(r"riboflavin", _re.I)),
-    ("Vitamin B6", _re.compile(r"pyridoxal|pyridoxine|\bvitamin b6\b|\bPLP\b", _re.I)),
-    ("Vitamin B9 (Folate)", _re.compile(r"\bfolate\b|folic acid", _re.I)),
-    ("Vitamin B12", _re.compile(r"\bvitamin b-?12\b|\bb12\b|cobalamin", _re.I)),
-    ("Vitamin C", _re.compile(r"ascorb|\bvitamin c\b", _re.I)),
-    ("Vitamin D", _re.compile(r"\bvitamin d\b|25-?hydroxyvitamin|calcidiol", _re.I)),
-    ("Vitamin E", _re.compile(r"\bvitamin e\b|tocopherol|tocotrienol", _re.I)),
-    ("Vitamin K", _re.compile(r"phylloquinone|\bvitamin k\b|menaquinone", _re.I)),
-    ("Calcium", _re.compile(r"\bcalcium\b", _re.I)),
-    ("Magnesium", _re.compile(r"magnesium", _re.I)),
-    ("Sodium", _re.compile(r"\bsodium\b", _re.I)),
-    ("Potassium", _re.compile(r"potassium", _re.I)),
-    ("Iron", _re.compile(r"\biron\b|ferritin|transferrin saturation|iron status", _re.I)),
-    ("Zinc", _re.compile(r"\bzinc\b", _re.I)),
-    ("Copper", _re.compile(r"\bcopper\b|ceruloplasmin", _re.I)),
-    ("Manganese", _re.compile(r"manganese", _re.I)),
-    ("Iodine", _re.compile(r"\biodine\b", _re.I)),
-    ("Selenium", _re.compile(r"selenium", _re.I)),
-    ("Molybdenum", _re.compile(r"molybden", _re.I)),
-]
-_LEVEL_WORD = _re.compile(
-    r"level|status|concentration|plasma|serum|circulating|biomarker", _re.I)
-# avoid a couple of well-known false positives that contain a nutrient word
-_TRAIT_EXCLUDE = _re.compile(
-    r"coronary artery calc|arterial calc|valve calc|channel blocker", _re.I)
+def _best_effect_allele(assocs, user_geno):
+    """Pick the effect allele to display: the strongest association's risk
+    allele that the SNP actually carries information about."""
+    for a in assocs:
+        if a.get("risk"):
+            return a["risk"], a.get("or"), a["trait"]
+    return "", None, (assocs[0]["trait"] if assocs else "")
 
 
-def _nutrient_for_trait(title):
-    if not title or _TRAIT_EXCLUDE.search(title) or not _LEVEL_WORD.search(title):
-        return None
-    for label, rx in _NUTRIENT_TRAIT:
-        if rx.search(title):
-            return label
-    return None
+def _highlight(effect_allele, user_geno, repute):
+    if user_geno in ("--", ""):
+        return ""
+    if effect_allele:
+        dose = user_geno.count(effect_allele)
+        if dose >= 2:
+            return "hl-orange"
+        if dose == 1:
+            return "hl-yellow"
+        return ""
+    if (repute or "").strip().lower() == "bad":
+        return "hl-orange"
+    return ""
 
 
-def attach_deana_nutrients(snps, deana_shards_dir, max_assoc_per_snp=6):
-    """Fold nutrient level/status associations from the deana evidence pack into
-    `snps`. Streams shard JSON files one at a time (build-time only) and keeps
-    only nutrient-relevant records, so memory and bundle size stay small.
+def annotate_variant(user_geno, snp_record, option):
+    """Build the full annotation for one matched variant.
 
-    Each match: ensures the SNP record exists, tags it with `nutrient` (panel
-    routing), and appends a catalog-style association the note engine already
-    understands. New nutrient rsids become matchable; everything else is ignored
-    so the rest of the report is unchanged."""
-    import glob
-    import json
-    shard_files = sorted(glob.glob(os.path.join(deana_shards_dir, "*.json")))
-    if not shard_files:
-        print(f"  (no deana shards found in {deana_shards_dir}; skipping)")
-        return snps
+    user_geno   : the user's genotype, strand-corrected & sorted, e.g. "AG"
+    snp_record  : the rich per-SNP dict from reference.pkl
+    option      : the matched genotype option dict (mag/repute/summary/desc)
 
-    added_records = 0
-    enriched_snps = set()
-    seen = set()                       # (rsid, trait) de-dup
-    for sf in shard_files:
-        try:
-            with open(sf) as fh:
-                recs = json.load(fh)
-        except Exception:
-            continue
-        for r in recs:
-            title = r.get("title", "")
-            nut = _nutrient_for_trait(title)
-            if not nut:
-                continue
-            trait = title.split(" association near")[0].strip()
-            risk = (r.get("riskAllele") or "").strip().upper()
-            if risk in ("NR", "NONE", "?", "NAN"):
-                risk = ""
-            genes_raw = r.get("genes") or []
-            gene = ""
-            for g in genes_raw:
-                gene = str(g).replace(" - ", "/").split("/")[0].strip()
-                if gene:
-                    break
-            for rsid in r.get("markerIds", []):
-                if not rsid or not rsid.startswith("rs"):
-                    continue
-                key = (rsid, trait.lower())
-                if key in seen:
-                    continue
-                seen.add(key)
-                # Only ADD genuinely new nutrient-level SNPs. If the rsid already
-                # exists in our reference it has an established meaning/topic
-                # (e.g. APOE = Alzheimer); we never re-tag it, so the rest of the
-                # report is unchanged and no variant gets hijacked into the panel.
-                if rsid in snps:
-                    continue
-                rec = {"rsid": rsid, "gene": gene, "genes": genes_raw,
-                       "chr": "", "pos": "", "orientation": "", "gmaf": None,
-                       "gwas": [], "catalog": [], "options": {},
-                       "nutrient": nut}
-                snps[rsid] = rec
-                added_records += 1
-                rec["catalog"].append({
-                    "trait": trait, "risk": risk, "or": None,
-                    "range": "", "pval": "", "gene": gene, "raf": {},
-                    "source": "deana", "evidence": r.get("evidenceLevel", ""),
-                    "repute": r.get("repute", ""),
-                })
-                enriched_snps.add(rsid)
-    print(f"  deana nutrient associations: {len(enriched_snps):,} SNPs "
-          f"enriched ({added_records:,} newly added)")
-    return snps
+    Returns a dict the report renders directly.
+    """
+    gene = snp_record.get("gene", "")
+    summary = (option.get("summary") or "").strip()
+    repute = (option.get("repute") or "neutral").strip() or "neutral"
+    mag = option.get("mag") or 0.0
 
+    # ClinVar-style pathogenicity carried on any catalog entry (from deana).
+    pathogenic = ""
+    for a in snp_record.get("catalog", []):
+        sig = str(a.get("sig", "") or "")
+        low = sig.lower()
+        if "pathogenic" in low and "conflict" not in low and "non-patho" not in low:
+            pathogenic = sig
+            break
 
-def attach_deana_general(snps, deana_shards_dir, levels=("high", "moderate")):
-    """Fold the BROADER deana evidence pack (clinical + GWAS) into the bundle so
-    that unique user uploads get matched and annotated. To stay lean we keep
-    only `levels` evidence (default high+moderate, dropping ~80k weak
-    'supplementary' records) and only ADD new rsids (never touch existing ones,
-    so the curated sections and SNPedia notes are unchanged). Each new SNP gets
-    one compact catalog entry carrying the trait and, crucially, the ClinVar
-    clinical significance so pathogenic findings can be flagged."""
-    import glob
-    import json
-    levels = set(levels)
-    shard_files = sorted(glob.glob(os.path.join(deana_shards_dir, "*.json")))
-    if not shard_files:
-        print(f"  (no deana shards in {deana_shards_dir}; skipping general merge)")
-        return snps
+    assocs = _collect_assocs(snp_record)
+    effect, eff_or, top_trait = _best_effect_allele(assocs, user_geno)
+
+    # ---- assemble the note from the priority layers --------------------
+    parts = []
+
+    # Layer 1: a real per-genotype summary leads (most specific, already plain
+    # language e.g. "somewhat lower vitamin B12 levels" / "65% efficiency...").
+    clean_summary = _scrub(summary)
+    have_summary = not _is_boiler(clean_summary)
+    if have_summary:
+        parts.append(clean_summary.rstrip("."))
+
+    # Track the topics already covered so we never repeat the same subject
+    # (e.g. "lower vitamin D" then "vitamin D insufficiency").
+    covered = _core_terms(clean_summary)
+
+    # Layer 2/3: trait associations as PLAIN-LANGUAGE implications (no alleles,
+    # no copies, no bare odds ratios). Add up to 2 on NEW topics.
     added = 0
-    for sf in shard_files:
-        try:
-            recs = json.load(open(sf))
-        except Exception:
+    for a in assocs:
+        if added >= 2:
+            break
+        ct = _clean_trait(a["trait"])
+        terms = _core_terms(ct)
+        if terms and terms & covered:           # same subject already covered
             continue
-        for r in recs:
-            if r.get("evidenceLevel") not in levels:
-                continue
-            ids = [m for m in r.get("markerIds", []) if m and m.startswith("rs")]
-            if not ids:
-                continue
-            title = (r.get("title") or "").strip()
-            trait = title.split(" association near")[0].strip()[:80]
-            risk = (r.get("riskAllele") or "").strip().upper()
-            if risk in ("NR", "NONE", "?", "NAN"):
-                risk = ""
-            gene = ""
-            for g in (r.get("genes") or []):
-                gene = str(g).replace(" - ", "/").split("/")[0].strip()
-                if gene:
-                    break
-            sig = r.get("clinicalSignificance") or ""
-            for rsid in ids:
-                if rsid in snps:                 # never overwrite existing
-                    continue
-                snps[rsid] = {
-                    "rsid": rsid, "gene": gene, "genes": ([gene] if gene else []),
-                    "chr": "", "pos": "", "orientation": "", "gmaf": None,
-                    "gwas": [], "options": {},
-                    "catalog": [{"trait": trait, "risk": risk, "or": None,
-                                 "range": "", "pval": "", "gene": gene, "raf": {},
-                                 "source": "deana", "sig": sig,
-                                 "evidence": r.get("evidenceLevel", "")}],
-                }
-                added += 1
-    print(f"  deana general merge ({'+'.join(sorted(levels))}): +{added:,} new SNPs")
-    return snps
-
-
-def ensure_curated(snps, curated_map, baselines):
-    """Guarantee every user-specified variant ID is present and matchable. IDs
-    already in the bundle keep their data; missing ones get a stub carrying the
-    category baseline note (so there is always *some* notation)."""
-    added = 0
-    for rsid, (label, _topic) in curated_map.items():
-        if rsid in snps:
+        sent = _implication(a["trait"], a.get("risk"), a.get("or"), user_geno,
+                            allow_typical=not have_summary)
+        if not sent:
             continue
-        note = baselines.get(label, "A user-specified variant.")
-        snps[rsid] = {
-            "rsid": rsid, "gene": "", "genes": [],
-            "chr": "", "pos": "", "orientation": "", "gmaf": None,
-            "gwas": [], "options": {},
-            "catalog": [{"trait": note, "risk": "", "or": None, "range": "",
-                         "pval": "", "gene": "", "raf": {}, "source": "curated"}],
-        }
+        parts.append(sent)
+        covered |= terms
         added += 1
-    print(f"  curated variants ensured present: +{added:,} stubs "
-          f"({len(curated_map)} total IDs)")
-    return snps
 
+    # Layer 4: curated baseline gene function -- guarantees a note for known
+    # genes even when nothing genotype-specific exists.
+    if not parts:
+        bn = gene_labels.baseline_note(gene)
+        if bn:
+            parts.append(bn)
 
-# ------------------------------------------------------- equilibrium parsing
+    # Layer 5: cleaned genotype-page description, true last resort.
+    if not parts:
+        desc = (option.get("desc") or "").strip()
+        if desc and not _is_boiler(desc):
+            parts.append(_scrub(desc))
 
-def build_ld(eq_csv, threshold=LD_THRESHOLD):
-    ld = defaultdict(set)
-    df = pd.read_csv(eq_csv)
-    for r in df.itertuples(index=False):
-        r2 = _to_float(getattr(r, "r2", None))
-        if r2 is not None and r2 >= threshold:
-            a, b = getattr(r, "rsid1", None), getattr(r, "rsid2", None)
-            if a and b:
-                ld[a].add(b)
-                ld[b].add(a)
-    return {k: sorted(v) for k, v in ld.items()}
+    # Final fallback: never blank. State what we do know.
+    if not parts:
+        if top_trait:
+            parts.append(f"Variant studied in relation to {_clean_trait(top_trait)}")
+        elif gene:
+            parts.append(f"Variant in {gene}")
+        else:
+            parts.append("Variant of unknown significance")
 
+    # Capitalize the first letter of each part, then join.
+    parts = [p[0].upper() + p[1:] if p else p for p in parts]
+    note = ". ".join(p for p in parts if p).strip()
+    if note and not note.endswith((".", "!", "?")):
+        note += "."
 
-# --------------------------------------------------------------------- build
+    # Surface clinical pathogenicity prominently.
+    if pathogenic:
+        tag = "Likely pathogenic" if "likely" in pathogenic.lower() and \
+              "/" not in pathogenic else pathogenic
+        note = f"ClinVar: {tag}. " + note
 
-def build(snp_csv, geno_csv, trait_csv, eq_csv, out_pkl, deana_dir=None,
-          deana_levels=("high", "moderate")):
-    print("parsing SNP pages ...")
-    snps = parse_snps(snp_csv)
-    print(f"  {len(snps):,} SNP pages")
+    hl = _highlight(effect, user_geno, repute)
+    if pathogenic and user_geno not in ("--", ""):
+        hl = "hl-orange"
 
-    print("attaching genotype options ...")
-    attach_genotypes(snps, geno_csv)
-
-    print("attaching GWAS-Catalog associations ...")
-    attach_catalog(snps, trait_csv)
-
-    if deana_dir:
-        print("attaching deana nutrient-level associations ...")
-        attach_deana_nutrients(snps, deana_dir)
-        if deana_levels:
-            print("attaching deana general evidence (broad coverage) ...")
-            attach_deana_general(snps, deana_dir, levels=deana_levels)
-
-    # Guarantee the user-specified variant IDs are present and routed.
-    try:
-        from . import curated as _curated
-    except ImportError:
-        import curated as _curated
-    print("ensuring curated variant IDs ...")
-    ensure_curated(snps, _curated.CURATED_VARIANTS, _curated.CURATED_BASELINE)
-
-    print("building linkage map ...")
-    ld = build_ld(eq_csv)
-    print(f"  {len(ld):,} SNPs with tight LD")
-
-    bundle = {"version": "2.0", "snps": snps, "ld": ld}
-    with open(out_pkl, "wb") as f:
-        pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    # quick quality readout
-    n_opts = sum(len(s["options"]) for s in snps.values())
-    n_gwas = sum(len(s["gwas"]) for s in snps.values())
-    n_cat = sum(len(s["catalog"]) for s in snps.values())
-    print(f"\nreference.pkl written: {out_pkl}")
-    print(f"  SNPs ............. {len(snps):,}")
-    print(f"  genotype options . {n_opts:,}")
-    print(f"  SNP-page GWAS .... {n_gwas:,}")
-    print(f"  catalog assocs ... {n_cat:,}")
-    return bundle
-
-
-if __name__ == "__main__":
-    args = sys.argv[1:]
-    snp = args[0] if len(args) > 0 else "data/snp_df.csv"
-    geno = args[1] if len(args) > 1 else "data/geno_df.csv"
-    trait = args[2] if len(args) > 2 else "data/trait_df.csv"
-    eq = args[3] if len(args) > 3 else "data/equilibrium_df.csv"
-    out = args[4] if len(args) > 4 else "data/reference.pkl"
-    # optional 6th arg: deana evidence-pack shards dir; 7th: evidence levels for
-    # the broad merge ("high,moderate" default; "high" leaner; "none" to disable)
-    deana = args[5] if len(args) > 5 else None
-    if len(args) > 6:
-        lv = args[6].strip().lower()
-        deana_levels = () if lv in ("none", "off", "") else tuple(lv.split(","))
-    else:
-        deana_levels = ("high", "moderate")
-    build(snp, geno, trait, eq, out, deana_dir=deana, deana_levels=deana_levels)
+    return {
+        "note": note,
+        "effect_allele": effect,
+        "dose": _dosage(user_geno, effect) or 0,
+        "primary_trait": top_trait,
+        "max_or": eff_or,
+        "mag": mag,
+        "repute": repute,
+        "hl": hl,
+        "gene": gene,
+        "pathogenic": bool(pathogenic),
+        "label": gene_labels.label(gene, fallback_trait=top_trait),
+        "label_known": gene_labels.is_known(gene),
+    }
