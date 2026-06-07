@@ -221,15 +221,26 @@ def _render_html(grouped, totals, user_display_name):
                      '<th class="c-effect">Effect</th>'
                      '<th class="c-geno">Your Genotype</th>'
                      '<th class="c-note">Notes</th></tr></thead><tbody>')
+            seen_notes = {}
             for r in sorted(rows, key=_interest, reverse=True):
                 effect_disp = _esc(r["effect_allele"]) if r["effect_allele"] else EMDASH
+                note = r["note"]
+                key = note.strip().lower()
+                # If an identical note already appeared in this section, don't
+                # repeat the whole sentence — show a short muted pointer instead.
+                if key and key in seen_notes:
+                    note_html = ('<span style="color:#999;">Additional variant '
+                                 '(see note above).</span>')
+                else:
+                    seen_notes[key] = True
+                    note_html = _esc(note)
                 p.append(
                     "<tr>"
                     f'<td class="c-gene">{_esc(r.get("gene") or EMDASH)}</td>'
                     f'<td class="c-rsid">{_esc(r["rsid"])}</td>'
                     f'<td class="c-effect">{effect_disp}</td>'
                     f'<td class="c-geno {r["hl"]}">{_esc(r["geno"])}</td>'
-                    f'<td class="c-note">{_esc(r["note"])}</td>'
+                    f'<td class="c-note">{note_html}</td>'
                     "</tr>"
                 )
             p.append('</tbody></table>')
