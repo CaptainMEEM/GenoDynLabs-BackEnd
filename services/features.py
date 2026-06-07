@@ -58,7 +58,7 @@ FEATURES = [
      "gain in carriers."),
     ("Omega-3 / Fish Oil Response", "diet", ["FADS1", "FADS2", "ELOVL2"],
      "FADS1/FADS2 build long-chain omega-3 (EPA/DHA) from plant precursors; "
-     "low-efficiency variants benefit more from preformed fish-oil omega-3."),
+     "low-efficiency variants make this conversion less efficient."),
     ("Amylase / Starch Digestion", "diet", ["AMY1A", "AMY1B", "AMY1C", "AMY2A", "AMY2B"],
      "The amylase region sets how well salivary/pancreatic amylase breaks down "
      "dietary starch (note: the main driver is AMY1 copy number, not single "
@@ -78,8 +78,8 @@ FEATURES = [
     ("CoQ10 (Ubiquinone) Deficiency", "conditions",
      ["COQ2", "COQ4", "COQ6", "COQ7", "COQ8A", "COQ8B", "COQ9",
       "PDSS1", "PDSS2", "NQO1", "ADCK3"],
-     "These genes synthesize coenzyme Q10; variants can lower CoQ10 and may "
-     "inform whether CoQ10 supplementation is worth discussing."),
+     "These genes synthesize coenzyme Q10 (ubiquinone); variants can lower the "
+     "body's CoQ10 production."),
     ("Wilson's Disease (Copper)", "conditions", ["ATP7B"],
      "ATP7B exports excess copper; pathogenic variants cause Wilson's disease, "
      "a treatable copper-overload disorder."),
