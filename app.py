@@ -70,6 +70,15 @@ else:
     MAX_LOCAL_JOBS = 2000
     log.info("dispatch: in-process ThreadPoolExecutor (no REDIS_URL)")
 
+# Fail CLOSED on a real (queued) deployment: if the genome would be written to
+# Redis, it MUST be encrypted at rest first. We refuse rather than silently
+# persisting a plaintext genome. The local thread-pool dev path (no Redis, no
+# persistence) is allowed to run unencrypted with the warning above.
+REQUIRE_ENCRYPTION = bool(REDIS_URL)
+if REQUIRE_ENCRYPTION and not crypto.encryption_enabled():
+    log.error("REDIS_URL is set but GENODYN_DATA_KEYS is not — uploads will be "
+              "refused until at-rest encryption is configured.")
+
 
 def _local_runner(job_id, uid, enc_payload, user_email, display_name):
     with _jobs_lock:
@@ -149,6 +158,12 @@ def upload(user):
     uid = user.get("uid")
     user_email = user.get("email")
     display_name = user.get("name") or ""
+
+    # Never persist a plaintext genome to the queue.
+    if REQUIRE_ENCRYPTION and not crypto.encryption_enabled():
+        log.error("refusing upload: at-rest encryption not configured")
+        return jsonify({"error": "Service is temporarily unavailable "
+                                 "(secure storage not configured)."}), 503
 
     if not user_email:
         return jsonify({"error": "Your account has no email on file"}), 400
