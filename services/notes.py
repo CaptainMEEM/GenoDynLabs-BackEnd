@@ -47,6 +47,34 @@ def _is_boiler(summary):
     return (not summary) or bool(_BOILER.match(summary))
 
 
+# Strip any allele / genotype / odds-ratio jargon out of free-text summaries so
+# the reader sees a plain implication, never "the G allele" or "OR 1.31".
+_SCRUB_PATTERNS = [
+    re.compile(r"(?i)\b(\d+\s+)?cop(y|ies)\s+of\s+the\s+[ACGT]{1,2}\s+(risk\s+)?allele"),
+    re.compile(r"(?i)\bthe\s+[ACGT]{1,2}\s+(risk\s+)?allele\b"),
+    re.compile(r"(?i)\b[ACGT]{1,2}\s+risk\s+allele\b"),
+    re.compile(r"(?i)\b(odds\s+ratio|OR)\s*[:=]?\s*\d+(\.\d+)?"),
+    re.compile(r"(?i)\bp\s*[=<]\s*\d[\d.eE+-]*"),
+    re.compile(r"(?i)\bgenotyp\w*\b"),
+    # strip any supplementation suggestion (user: no supplement notation anywhere)
+    re.compile(r"(?i)\s*[;,\u2014\-]?\s*\b(consider\s+)?supplement\w*\b[^.?!]*[.?!]?"),
+    re.compile(r"\((?:\s*[\u2191\u2193]\s*)?\)"),     # empty arrow parens
+]
+
+
+def _scrub(text):
+    if not text:
+        return ""
+    s = text
+    for rx in _SCRUB_PATTERNS:
+        s = rx.sub("", s)
+    s = re.sub(r"\s*[\u2014\-]\s*$", "", s)       # dangling dash
+    s = re.sub(r"\s+([:;,.])", r"\1", s)          # space before punctuation
+    s = re.sub(r"[:;,]\s*$", "", s)               # dangling colon/comma
+    s = re.sub(r"\s{2,}", " ", s).strip(" .;,-\u2014")
+    return s
+
+
 def _or_phrase(orv):
     """Readable OR clause. Values outside [0.1, 10] are almost always effect
     sizes on continuous traits (metabolite/biomarker levels), not true
@@ -67,27 +95,101 @@ def _dosage(user_geno, allele):
     return user_geno.count(allele)
 
 
-def _assoc_sentence(trait, risk, orv, user_geno):
-    """One readable clause for a single trait association, dosage-aware."""
-    trait = (trait or "").strip()
+# Words that mark a "level/biomarker" trait (phrased as higher/lower levels)
+# vs. a disease/risk trait (phrased as an X-times risk).
+_LEVEL_RX = re.compile(
+    r"(?i)\b(level|levels|concentration|status|biomarker|metabolite|"
+    r"vitamin|folate|homocysteine|ferritin|cholesterol|amino acid|"
+    r"glycosylation|fatty acid)\b")
+
+
+def _clean_trait(trait):
+    """Tidy a trait string for human reading."""
+    t = (trait or "").split(" association near")[0].strip()
+    t = re.sub(r"\s+", " ", t).strip(" .;,-")
+    return t
+
+
+# State words that already describe a condition -> never append "levels" to them.
+_STATE_RX = re.compile(
+    r"(?i)(insufficien|deficien|disease|syndrome|intoleran|disorder|cancer|"
+    r"\brisk\b|tolerance|persistence|flush|sensitivity)")
+
+# Stop-words that don't identify the topic of a trait (used for de-duplication).
+_STOP = {"level", "levels", "status", "concentration", "plasma", "serum",
+         "blood", "total", "risk", "trait", "traits", "disease", "association",
+         "circulating", "biomarker", "biomarkers", "values", "value", "higher",
+         "lower", "with"}
+
+
+def _core_terms(text):
+    """The topic-identifying words in a trait/summary, for de-dup by subject."""
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) > 3 and w not in _STOP}
+
+
+def _noun_form(trait):
+    """Trait phrased as a noun for 'higher/lower ___'. Adds 'levels' only when
+    the trait is a measurable quantity, never to a state word like 'deficiency'."""
+    low = trait.lower()
+    if _STATE_RX.search(low) or "level" in low or "status" in low or \
+       "concentration" in low:
+        return trait
+    return trait + " levels"
+
+
+def _risk_multiplier(orv):
+    """Turn an odds ratio into a plain 'X times higher/lower risk' phrase, but
+    only when it is a believable case/control OR (roughly 1.1-10x). Returns ''
+    when the number isn't a trustworthy risk multiplier."""
+    if not orv or orv <= 0:
+        return ""
+    if 1.1 <= orv <= 10:
+        return f"about {orv:.1f}\u00d7 higher risk"
+    if 0.1 <= orv <= 0.91:
+        return f"about {1.0 / orv:.1f}\u00d7 lower risk"
+    return ""               # ~1.0 (no effect) or implausible -> no multiplier
+
+
+def _implication(trait, risk, orv, user_geno, allow_typical=True):
+    """Plain-language implication for one association, with NO allele/copy talk.
+
+    - Level/biomarker traits  -> 'Linked to higher/lower <trait>' (direction from
+      the odds ratio); 'Typical <trait>' when the user doesn't carry the variant
+      (only if allow_typical).
+    - Disease/risk traits     -> 'About 1.5x higher risk of <disease>' when the
+      user carries the effect allele and the OR is a believable multiplier;
+      otherwise 'Associated with <disease>'. Never states a risk for a variant
+      the user does not carry.
+    Trait case is preserved (so 'LDL', 'Alzheimer' stay correct).
+    """
+    trait = _clean_trait(trait)
     if not trait:
         return ""
-    dose = _dosage(user_geno, risk)
-    pieces = []
-    if dose is not None and risk:
+    dose = _dosage(user_geno, risk)            # used only to decide IF it applies
+    is_level = bool(_LEVEL_RX.search(trait)) and not _STATE_RX.search(trait)
+
+    if is_level:
+        noun = _noun_form(trait)
+        if dose is None:                       # no allele info -> generic
+            return f"Associated with {noun}"
         if dose == 0:
-            pieces.append(f"you carry no {risk} risk allele")
-        elif dose == 1:
-            pieces.append(f"1 copy of the {risk} risk allele")
-        else:
-            pieces.append(f"2 copies of the {risk} risk allele")
-    orp = _or_phrase(orv)
-    head = trait
-    if orp:
-        head = f"{trait} ({orp})"
-    if pieces:
-        return f"{head} \u2014 {pieces[0]}"
-    return head
+            return f"Typical {noun}" if allow_typical else ""
+        if orv and orv > 1:
+            return f"Linked to higher {noun}"
+        if orv and orv < 1:
+            return f"Linked to lower {noun}"
+        return f"Linked to altered {noun}"
+
+    # disease / risk / state trait
+    if dose == 0:
+        return ""                              # user doesn't carry it -> don't state
+    mult = _risk_multiplier(orv)
+    if mult and dose:
+        return f"{mult[0].upper()}{mult[1:]} of {trait}"
+    if dose or dose is None:
+        return f"Associated with {trait}"
+    return ""
 
 
 def _collect_assocs(snp_record):
@@ -167,23 +269,34 @@ def annotate_variant(user_geno, snp_record, option):
     # ---- assemble the note from the priority layers --------------------
     parts = []
 
-    # Layer 1: a real per-genotype summary leads (most specific to the user).
-    if not _is_boiler(summary):
-        parts.append(summary.rstrip("."))
+    # Layer 1: a real per-genotype summary leads (most specific, already plain
+    # language e.g. "somewhat lower vitamin B12 levels" / "65% efficiency...").
+    clean_summary = _scrub(summary)
+    have_summary = not _is_boiler(clean_summary)
+    if have_summary:
+        parts.append(clean_summary.rstrip("."))
 
-    # Layer 2/3: trait associations with dosage + direction. Add up to 2 that
-    # aren't already implied by the summary.
+    # Track the topics already covered so we never repeat the same subject
+    # (e.g. "lower vitamin D" then "vitamin D insufficiency").
+    covered = _core_terms(clean_summary)
+
+    # Layer 2/3: trait associations as PLAIN-LANGUAGE implications (no alleles,
+    # no copies, no bare odds ratios). Add up to 2 on NEW topics.
     added = 0
-    summary_low = summary.lower()
     for a in assocs:
         if added >= 2:
             break
-        if a["trait"].lower() in summary_low:
+        ct = _clean_trait(a["trait"])
+        terms = _core_terms(ct)
+        if terms and terms & covered:           # same subject already covered
             continue
-        sent = _assoc_sentence(a["trait"], a.get("risk"), a.get("or"), user_geno)
-        if sent:
-            parts.append(sent)
-            added += 1
+        sent = _implication(a["trait"], a.get("risk"), a.get("or"), user_geno,
+                            allow_typical=not have_summary)
+        if not sent:
+            continue
+        parts.append(sent)
+        covered |= terms
+        added += 1
 
     # Layer 4: curated baseline gene function -- guarantees a note for known
     # genes even when nothing genotype-specific exists.
@@ -196,17 +309,19 @@ def annotate_variant(user_geno, snp_record, option):
     if not parts:
         desc = (option.get("desc") or "").strip()
         if desc and not _is_boiler(desc):
-            parts.append(desc)
+            parts.append(_scrub(desc))
 
     # Final fallback: never blank. State what we do know.
     if not parts:
         if top_trait:
-            parts.append(f"Variant studied in relation to {top_trait.lower()}")
+            parts.append(f"Variant studied in relation to {_clean_trait(top_trait)}")
         elif gene:
             parts.append(f"Variant in {gene}")
         else:
             parts.append("Variant of unknown significance")
 
+    # Capitalize the first letter of each part, then join.
+    parts = [p[0].upper() + p[1:] if p else p for p in parts]
     note = ". ".join(p for p in parts if p).strip()
     if note and not note.endswith((".", "!", "?")):
         note += "."
