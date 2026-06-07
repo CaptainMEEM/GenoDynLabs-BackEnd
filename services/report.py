@@ -34,6 +34,33 @@ except ImportError:
 EMDASH = "\u2014"
 
 
+# Once-per-article context line (what the gene/nutrient does). This used to be
+# crammed into the first row's Notes and then echoed as "see note above" on the
+# rest; now it lives under the header and the Notes column is reserved for what
+# the user's OWN genotype means.
+_SUBTITLE = {}
+_SUBTITLE.update(gene_labels.NUTRIENT_BASELINE)            # nutrient panels
+_SUBTITLE.update(curated.CURATED_BASELINE)                 # curated categories
+for _f in features.FEATURES:                               # feature articles
+    _SUBTITLE[_f[0]] = _f[3]
+for _alabel, _info in features.ARCHETYPES.items():         # interpretive archetypes
+    _SUBTITLE[_alabel] = _info["note"]
+
+
+def _subtitle(article, rows):
+    """Context sentence for an article header, or '' if none applies. Suppressed
+    for empty-state panels (their placeholder note already carries the context)."""
+    if not rows or any(r.get("_placeholder") for r in rows):
+        return ""
+    sub = _SUBTITLE.get(article)
+    if sub:
+        return sub
+    gene = (rows[0].get("gene") or "").strip()
+    if gene and gene != EMDASH:
+        return gene_labels.baseline_note(gene)
+    return ""
+
+
 def _esc(s):
     return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             if s is not None else "")
@@ -127,6 +154,8 @@ h3.article { font-size: 10pt; color: #1f7a4d; margin: 12pt 0 3pt;
              padding-bottom: 1pt; border-bottom: 1pt solid #cfe6da;
              page-break-after: avoid; }
 h3.article .meta { color: #999; font-weight: 400; font-size: 8.5pt; }
+p.article-sub { margin: 1pt 0 4pt; color: #555; font-size: 8.2pt;
+                font-style: italic; page-break-after: avoid; }
 
 table.snp { width: 100%; border-collapse: collapse; font-size: 8.3pt;
             page-break-inside: auto; }
@@ -171,15 +200,18 @@ def _render_html(grouped, totals, user_display_name):
         f'<td class="big">{totals["with_trait"]:,}</td>'
         f'<td class="big">{totals["flagged"]:,}</td>'
         f'<td class="big">{totals["topics"]}</td></tr>',
-        '<tr><td>annotated variants</td><td>with a known trait association</td>'
+        '<tr><td>variants you carry</td><td>with a known trait association</td>'
         '<td>flagged genotypes</td><td>topic areas covered</td></tr>',
         '</table>',
-        '<p style="margin:8pt 0 0;">Variants are grouped by physiological system, '
-        'then by the gene\'s primary function. A highlighted <b>Your Genotype</b> '
-        'cell means you carry the effect allele (orange = two copies, yellow = one) '
-        'or a genotype SNPedia flags as notable. Notes combine SNPedia genotype '
-        'summaries with GWAS Catalog associations (odds ratios shown where known). '
-        'Data courtesy of SNPedia and the NHGRI-EBI GWAS Catalog.</p>',
+        '<p style="margin:8pt 0 0;">This report lists only the variants <b>you '
+        'actually carry</b> \u2014 where at least one copy of the effect allele '
+        'is present in your genotype, or your genotype has a specific documented '
+        'finding. Wild-type (reference) results are not listed. A highlighted '
+        '<b>Your Genotype</b> cell shows the dosage (orange = two copies, '
+        'yellow = one); the <b>Effect</b> column only ever shows an allele you '
+        'carry. Each note describes what your genotype means; the line under each '
+        'heading explains what that gene or nutrient does. Data courtesy of '
+        'SNPedia and the NHGRI-EBI GWAS Catalog.</p>',
         (f'<p style="margin:6pt 0 0;color:#666;">This report highlights your '
          f'{totals["variants"]:,} most informative variants. '
          f'{totals["truncated"]:,} additional lower-signal matches were '
@@ -216,31 +248,23 @@ def _render_html(grouped, totals, user_display_name):
                 meta = "not assessed"
             p.append(f'<h3 class="article">{_esc(article)}'
                      f' <span class="meta">({meta})</span></h3>')
+            sub = _subtitle(article, rows)
+            if sub:
+                p.append(f'<p class="article-sub">{_esc(sub)}</p>')
             p.append('<table class="snp"><thead><tr>'
                      '<th class="c-gene">Gene</th><th class="c-rsid">RS ID</th>'
                      '<th class="c-effect">Effect</th>'
                      '<th class="c-geno">Your Genotype</th>'
                      '<th class="c-note">Notes</th></tr></thead><tbody>')
-            seen_notes = {}
             for r in sorted(rows, key=_interest, reverse=True):
                 effect_disp = _esc(r["effect_allele"]) if r["effect_allele"] else EMDASH
-                note = r["note"]
-                key = note.strip().lower()
-                # If an identical note already appeared in this section, don't
-                # repeat the whole sentence — show a short muted pointer instead.
-                if key and key in seen_notes:
-                    note_html = ('<span style="color:#999;">Additional variant '
-                                 '(see note above).</span>')
-                else:
-                    seen_notes[key] = True
-                    note_html = _esc(note)
                 p.append(
                     "<tr>"
                     f'<td class="c-gene">{_esc(r.get("gene") or EMDASH)}</td>'
                     f'<td class="c-rsid">{_esc(r["rsid"])}</td>'
                     f'<td class="c-effect">{effect_disp}</td>'
                     f'<td class="c-geno {r["hl"]}">{_esc(r["geno"])}</td>'
-                    f'<td class="c-note">{note_html}</td>'
+                    f'<td class="c-note">{_esc(r["note"])}</td>'
                     "</tr>"
                 )
             p.append('</tbody></table>')
@@ -307,22 +331,31 @@ def build_pdf(records, user_display_name="", target_pages=100,
             cap = max_rows_per_article          # uniform 14-row cap, nutrients included
             kept, kept_ids = [], set()
             for r in sorted(arows, key=_interest, reverse=True):
+                # CARRIED-ONLY GATE: a row is shown only when the user's own
+                # genotype carries the effect allele or has a real genotype-
+                # specific / clinical finding (notes.annotate_variant set this).
+                # This drops the wild-type "Effect: G / Your Genotype: CC" rows.
+                if not r.get("informative"):
+                    continue
                 links = ld_map.get(r["rsid"], ())
-                informative = (r.get("hl") in ("hl-orange", "hl-yellow")
-                               or r.get("max_or") or r.get("label_known"))
-                if not informative and any(o in kept_ids for o in links):
+                strong = (r.get("hl") in ("hl-orange", "hl-yellow")
+                          or r.get("max_or") or r.get("pathogenic"))
+                # Collapse only weak rows that are in tight LD with one we kept.
+                if not strong and any(o in kept_ids for o in links):
                     continue
                 kept.append(r)
                 kept_ids.add(r["rsid"])
-            capped[article] = kept[:cap]
+            if kept:                            # never emit an empty article here
+                capped[article] = kept[:cap]    # (nutrient empties re-added below)
 
         keep, extras = {}, []
         for article, arows in capped.items():
-            standout = any(r.get("hl") == "hl-orange"
+            standout = any(r.get("hl") in ("hl-orange", "hl-bad")
                            or (r.get("mag") or 0) >= 2.5 for r in arows)
             # Nutrient-panel and curated FEATURE articles (Lactose, MTHFR, CoQ10,
-            # …) ALWAYS keep their own header. Otherwise: own header if 2+
-            # variants or a genuinely notable single finding.
+            # …) keep their own header whenever they have ≥1 carried finding.
+            # Otherwise: own header if 2+ variants or a genuinely notable single
+            # finding; a lone weak variant falls into the per-topic Additional.
             if article in PINNED or len(arows) >= 2 or standout:
                 keep[article] = arows
             else:
@@ -380,10 +413,12 @@ def build_pdf(records, user_display_name="", target_pages=100,
     truncated = total_found - rows_used
 
     # Guarantee the COMPLETE vitamins/minerals panel: every requested nutrient
-    # appears, even if the user had no variant there (honest empty-state row).
+    # appears, with the user's CARRIED variants if any, else an honest empty-
+    # state row. After the carried-only filter a panel can be present-but-empty
+    # (all wild-type), so we test for "no real rows", not just "missing".
     nutrients = grouped.setdefault("nutrients", {})
     for label in gene_labels.PANEL_ORDER:
-        if label not in nutrients:
+        if not nutrients.get(label):
             nutrients[label] = [{
                 "gene": EMDASH, "rsid": EMDASH, "effect_allele": "",
                 "geno": EMDASH, "hl": "", "mag": 0.0, "max_or": None,
