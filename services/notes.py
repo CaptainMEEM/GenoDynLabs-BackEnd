@@ -98,21 +98,15 @@ def _collect_assocs(snp_record):
                   key=lambda a: abs((a["or"] or 1) - 1), reverse=True)
 
 
-def _carried_assoc(assocs, user_geno):
-    """Return the strongest association whose risk allele the user ACTUALLY
-    carries, as (risk, or, trait, dose). If none is carried, return the strongest
-    association's risk allele with dose 0 (used only for context, never shown)."""
-    best_uncarried = None
+def _strongest_assoc(assocs, allele):
+    """The (or, trait) of the strongest association naming `allele` as its risk
+    allele, else the strongest association's (or, trait), else (None, "")."""
     for a in assocs:
-        risk = a.get("risk") or ""
-        dose = _dosage(user_geno, risk)
-        if risk and dose:                   # dose >= 1 -> user carries it
-            return risk, a.get("or"), a["trait"], dose
-        if best_uncarried is None:
-            best_uncarried = (risk, a.get("or"), a.get("trait", ""), dose or 0)
-    if best_uncarried:
-        return best_uncarried
-    return "", None, "", 0
+        if (a.get("risk") or "").upper() == allele:
+            return a.get("or"), a.get("trait", "")
+    if assocs:
+        return assocs[0].get("or"), assocs[0].get("trait", "")
+    return None, ""
 
 
 def _dose_phrase(dose, risk):
@@ -147,17 +141,77 @@ def _carrier_sentence(dose, risk, orv, nutrient, trait):
 
 
 def _highlight(carried, dose, repute, pathogenic_carried):
+    rl = (repute or "").strip().lower()
     if pathogenic_carried:
         return "hl-orange"
     if carried:
-        if dose >= 2:
-            return "hl-orange"
-        return "hl-yellow"
-    rl = (repute or "").strip().lower()
-    if rl == "good":
-        return "hl-good"
+        if rl == "bad":
+            return "hl-bad"                  # carried + adverse keeps its tint
+        if rl == "good":
+            return "hl-good"
+        return "hl-orange" if dose >= 2 else "hl-yellow"
     if rl == "bad":
         return "hl-bad"
+    if rl == "good":
+        return "hl-good"
+    return ""
+
+
+def _scored_options(snp_record):
+    """[(sorted_geno, notability)] for each documented biallelic genotype, where
+    notability ranks how 'interesting' SNPedia considers that genotype (magnitude,
+    with a non-neutral repute as a secondary signal so flat-magnitude SNPs still
+    rank)."""
+    out = []
+    for geno, opt in (snp_record.get("options") or {}).items():
+        g = "".join(ch for ch in (geno or "").upper() if ch in _VALID)
+        if len(g) != 2:
+            continue
+        mag = float(opt.get("mag") or 0.0)
+        rep = (opt.get("repute") or "").strip().lower()
+        rep_bonus = 0.5 if rep in ("bad", "good") else 0.0
+        out.append((g, mag + rep_bonus))
+    return out
+
+
+def _effect_from_options(snp_record):
+    """Derive the effect/variant allele from SNPedia's own genotype table: the
+    allele that distinguishes the most-notable documented genotype from the
+    least-notable (reference) one. Returns "" when it can't be told apart."""
+    scored = _scored_options(snp_record)
+    if len(scored) < 2:
+        return ""
+    scored.sort(key=lambda x: x[1])
+    lo_geno, lo_n = scored[0]
+    hi_geno, hi_n = scored[-1]
+    if hi_n <= lo_n:                          # no spread -> nothing to learn
+        return ""
+    distinguishing = set(hi_geno) - set(lo_geno)
+    return next(iter(distinguishing)) if len(distinguishing) == 1 else ""
+
+
+def _is_reference_geno(snp_record, user_geno):
+    """True only when we can confidently say the user's genotype is the SNP's
+    reference (least-notable) genotype. False if the options can't tell us."""
+    scored = _scored_options(snp_record)
+    if len(scored) < 2:
+        return False
+    scored.sort(key=lambda x: x[1])
+    return scored[0][0] == "".join(sorted(c for c in user_geno if c in _VALID))
+
+
+def _variant_allele(snp_record, assocs):
+    """The SNP's single effect/variant allele, from the strongest available
+    signal: (1) SNPedia magnitude/repute table, then (2) any GWAS/Catalog risk
+    allele. Independent of the user — carriage is checked separately. "" if the
+    SNP gives us no way to name a variant allele."""
+    ea = _effect_from_options(snp_record)
+    if ea:
+        return ea
+    for a in assocs:
+        r = (a.get("risk") or "").upper()
+        if len(r) == 1 and r in _VALID:
+            return r
     return ""
 
 
@@ -185,18 +239,36 @@ def annotate_variant(user_geno, snp_record, option):
             break
 
     assocs = _collect_assocs(snp_record)
-    risk, eff_or, top_trait, dose = _carried_assoc(assocs, user_geno)
-    carried = bool(risk) and dose >= 1
-
     real_summary = bool(summary) and not _is_boiler(summary)
-    flagged = (mag >= 2.0) or ((repute.lower() in ("bad", "good")) and mag >= 1.0)
+
+    # UNIVERSAL EFFECT-ALLELE RULE.
+    # Identify the SNP's variant (effect) allele from any signal, then keep the
+    # row only if the user CARRIES it. The Effect column is therefore always a
+    # single allele that is present in the user's genotype — never blank on a
+    # shown row, and never an allele the user doesn't have.
+    risk = _variant_allele(snp_record, assocs)
+
+    # Last-resort: a documented finding on a HOMOZYGOUS genotype means both
+    # copies are the relevant allele, so that allele is the effect — unless the
+    # options table tells us this genotype is actually the reference one.
+    if not risk and geno_known:
+        bases = [c for c in user_geno if c in _VALID]
+        if len(bases) == 2 and bases[0] == bases[1] and (
+                real_summary or pathogenic or repute.lower() in ("bad", "good")):
+            if not _is_reference_geno(snp_record, user_geno):
+                risk = bases[0]
+
+    dose = _dosage(user_geno, risk) or 0
+    carried = bool(risk) and dose >= 1
+    eff_or, top_trait = _strongest_assoc(assocs, risk) if carried else (None, "")
     pathogenic_carried = bool(pathogenic) and carried
 
-    # The variant earns a row ONLY if the user's own genotype shows something.
-    informative = bool(geno_known and (
-        carried or real_summary or pathogenic_carried or flagged))
+    # A row is shown ONLY when we can name an effect allele the user carries.
+    # No carried effect allele -> no row (this is "if it doesn't match the
+    # genotype it shouldn't be there", applied uniformly to every variant).
+    informative = bool(geno_known and carried)
 
-    # Effect allele to DISPLAY: only ever an allele the user actually carries.
+    # Effect allele to DISPLAY: always the carried allele on a shown row.
     effect_display = risk if carried else ""
 
     # ---- assemble the note: always about the user's genotype ----------------
@@ -211,24 +283,16 @@ def annotate_variant(user_geno, snp_record, option):
         parts.append(f"ClinVar: {tag}{tail} {EMDASH} {carrier}")
 
     if real_summary:
-        # SNPedia's per-genotype sentence is already specific to THIS genotype.
+        # SNPedia's per-genotype sentence is already specific to THIS genotype;
+        # the Effect column (now filled above) shows which allele it concerns.
         parts.append(summary.rstrip("."))
     elif carried:
         parts.append(_carrier_sentence(dose, risk, eff_or, nutrient, top_trait))
-    elif flagged and not parts:
-        desc = (option.get("desc") or "").strip()
-        if desc and not _is_boiler(desc):
-            parts.append(desc.rstrip("."))
-        else:
-            parts.append(f"SNPedia flags your genotype as notable "
-                         f"(magnitude {mag:.1f})")
 
     # Safety net so the field is never blank for a row we *do* show. (Filtered
     # rows keep whatever is here but are not rendered.)
     if not parts:
-        if real_summary:
-            parts.append(summary.rstrip("."))
-        elif geno_known:
+        if geno_known:
             parts.append(f"You carry the {user_geno} genotype")
         else:
             parts.append("Not genotyped in your data")
